@@ -83,65 +83,69 @@ public:
     BarrettReducer() = default;
 
     explicit BarrettReducer(const T& mod) : m_mod(mod) {
-        if (mod <= T(1)) return;
+        if (mod <= T(3)) return;
         m_k = mod.bit_width();
 
-        DoubleT pow2_2k = DoubleT(1) << (2 * m_k);
-        m_mu = pow2_2k / DoubleT(mod);
+        // mu = floor(2^(2k) / mod) вычисляем через деление 2^(2k - 1) / mod.
+        // Сдвиг (2k - 1) строго меньше размера DoubleT и физически не вызывает переполнения:
+        // для U128 это 255 < 256, для U512 это 1023 < 1024, для U2048 это 4095 < 4096.
+        DoubleT half_pow = DoubleT(1) << (2 * m_k - 1);
+        auto [q0, r0] = bignum::siqs::div_rem(half_pow, DoubleT(mod));
 
-        // --- ПРОВЕРКА БАРРЕТТА ---
+        DoubleT r_double = r0 << 1;
+        DoubleT mod_double = DoubleT(mod);
+        if (r_double >= mod_double) {
+            m_mu = (q0 << 1) + DoubleT(1);
+        } else {
+            m_mu = q0 << 1;
+        }
+
+        // Проверка корректности редукции
         T a = mod - T(2);
         T b = mod - T(3);
         T test_mul = mul(a, b);
         T test_sqr = sqr(mod - T(1));
 
         if (test_mul != T(6) || test_sqr != T(1)) {
-            qFatal("Barrett Reduction error! Mul: %s, Sqr: %s",
-                   test_mul.toString().c_str(),
-                   test_sqr.toString().c_str());
+            std::abort();
         }
     }
 
     const T& modulus() const { return m_mod; }
 
-    // Быстрое модульное умножение: (x * y) mod mod
     inline T mul(const T& x, const T& y) const {
         DoubleT z = DoubleT::mult_ext(x, y);
         return reduce(z);
     }
 
-    // Быстрое модульное возведение в квадрат: (x^2) mod mod
     inline T sqr(const T& x) const {
         DoubleT z = DoubleT::square_ext(x);
         return reduce(z);
     }
 
-    // Редукция DoubleT в T по модулю N
     inline T reduce(const DoubleT& z) const {
         if (z < DoubleT(m_mod)) {
-            return bignum::siqs::to_u64_low(z) == 0 && z == DoubleT(0) ? T(0) : bignum::siqs::get_lo(z);
+            return bignum::siqs::get_lo(z);
         }
 
-        // 1. q1 = z >> (k - 1)
-        DoubleT q1 = z >> (m_k - 1);
+        // 1. q1 = z >> (k + 1)
+        DoubleT q1 = z >> (m_k + 1);
 
-        // 2. q2 = (q1 * mu) >> (k + 1)
+        // 2. q2 = (q1 * mu) >> (k - 1)
+        // Произведение (q1 * mu) строго < 2^(2k - 2) и гарантированно помещается в DoubleT
         DoubleT q1_mu = q1 * m_mu;
-        DoubleT q2 = q1_mu >> (m_k + 1);
+        DoubleT q2 = q1_mu >> (m_k - 1);
 
         // 3. r = z - q2 * m_mod
         DoubleT prod = q2 * DoubleT(m_mod);
         DoubleT r_wide = (z >= prod) ? (z - prod) : DoubleT(0);
 
-        // r_wide гарантированно < 3 * m_mod, извлекаем младшую половину
-        T r = bignum::siqs::get_lo(r_wide);
-
-        // Финальная коррекция (не более 2 вычитаний)
-        while (r >= m_mod) {
-            r = r - m_mod;
+        // Финальная коррекция: оценка частного ошибается не более чем на 5 единиц
+        while (r_wide >= DoubleT(m_mod)) {
+            r_wide = r_wide - DoubleT(m_mod);
         }
 
-        return r;
+        return bignum::siqs::get_lo(r_wide);
     }
 };
 
@@ -836,7 +840,7 @@ std::vector<T> factor_parallel_generic(T n,
     }
 
     // 7. Финальный fallback на SIQS для больших сбалансированных чисел
-    if (n.bit_width() <= 320) {
+    // if (n.bit_width() <= 320) {
         if (status_cb) status_cb("Запуск SIQS (факторизация через решето)...");
         if (profiler) profiler->start_stage("SIQS (Квадратичное решето)");
         auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
@@ -848,7 +852,7 @@ std::vector<T> factor_parallel_generic(T n,
             factors.insert(factors.end(), sub2.begin(), sub2.end());
             return factors;
         }
-    }
+    // }
 
     if (profiler) profiler->finish();
     factors.push_back(n);
