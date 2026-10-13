@@ -201,8 +201,9 @@ bool miller_test_generic(T d, const T& n) {
     return false;
 }
 
-template <typename T>
-bool is_prime_generic(const T& n, int k = 20) {
+template<typename T>
+bool is_prime_generic(const T &n, int k = 20)
+{
     if (n <= T(1)) return false;
     if (n <= T(3)) return true;
     if ((n & T(1)) == T(0)) return false;
@@ -840,17 +841,19 @@ std::vector<T> factor_parallel_generic(T n,
     }
 
     // 7. Финальный fallback на SIQS для больших сбалансированных чисел
-    // if (n.bit_width() <= 320) {
-        if (status_cb) status_cb("Запуск SIQS (факторизация через решето)...");
-        if (profiler) profiler->start_stage("SIQS (Квадратичное решето)");
-        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
-        if (siqs_res.has_value()) {
-            T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
-            factors.insert(factors.end(), sub1.begin(), sub1.end());
-            factors.insert(factors.end(), sub2.begin(), sub2.end());
-            return factors;
+    // if (n.bit_width() <= 320) { // Не забудь включить ограничение в solver.
+    if (status_cb)
+        status_cb("Запуск SIQS (факторизация через решето)...");
+    if (profiler)
+        profiler->start_stage("SIQS (Квадратичное решето)");
+    auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
+    if (siqs_res.has_value()) {
+        T f = *siqs_res;
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+        factors.insert(factors.end(), sub1.begin(), sub1.end());
+        factors.insert(factors.end(), sub2.begin(), sub2.end());
+        return factors;
         }
     // }
 

@@ -401,9 +401,9 @@ public:
     std::optional<T> solve(std::function<void(const std::string&)> status_cb = nullptr) {
         m_seen_u.clear();
         uint32_t bits = m_N.bit_width();
-        if (bits > 320) {
-            return std::nullopt;
-        }
+        // if (bits > 320) {
+        // return std::nullopt;
+        // }
 
         // Адаптивный размер факторной базы
         size_t fb_size = 500;
