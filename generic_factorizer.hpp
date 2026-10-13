@@ -808,31 +808,54 @@ std::vector<T> factor_parallel_generic(T n,
 
     // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит
     if (n.bit_width() > 135) {
-        struct EcmStage {
+        struct EcmStage
+        {
             unsigned curves;
             uint32_t B1;
             uint32_t B2;
         };
 
-        std::vector<EcmStage> ecm_plan = {
-            {25,   2000,    60000},
-            {50,  10000,   300000},
-            {150, 50000,  1500000},
-            {450, 110000, 3500000}
-        };
+        size_t bits = n.bit_width();
+        std::vector<EcmStage> ecm_plan;
 
-        for (const auto& stage : ecm_plan) {
-            if (::u128::Globals::LoadStop()) return factors;
-            std::string stage_name = "ECM (B1=" + std::to_string(stage.B1) +
-                                     ", B2=" + std::to_string(stage.B2) +
-                                     ", кривых=" + std::to_string(stage.curves) + ")";
-            if (profiler) profiler->start_stage(stage_name);
+        // Базовый план (быстрый поиск делителей до 20-30 цифр)
+        ecm_plan.push_back({25, 2000, 60000}); // Для поиска мелких факторов
+        ecm_plan.push_back({50, 10000, 300000});
+
+        // Средний план (добавляется для чисел > 200 бит)
+        if (bits > 200) {
+            ecm_plan.push_back({150, 50000, 1500000});
+            ecm_plan.push_back({450, 110000, 3500000}); // Граница вашего старого плана
+        }
+
+        // Продвинутый план для больших чисел (> 350 бит)
+        if (bits > 350) {
+            ecm_plan.push_back({1000, 250000, 8500000});   // Нацелен на поиск факторов ~35-40 бит
+            ecm_plan.push_back({3000, 1000000, 40000000}); // Нацелен на поиск факторов ~45-50 бит
+        }
+
+        // Тяжелый план для экстремальных чисел (> 600 бит)
+        if (bits > 600) {
+            ecm_plan.push_back({10000, 3000000, 120000000});  // Факторы ~55-60 бит
+            ecm_plan.push_back({25000, 11000000, 500000000}); // Факторы ~65-70 бит
+        }
+
+        for (const auto &stage : ecm_plan) {
+            if (::u128::Globals::LoadStop())
+                return factors;
+            std::string stage_name = "ECM (B1=" + std::to_string(stage.B1)
+                                     + ", B2=" + std::to_string(stage.B2)
+                                     + ", кривых=" + std::to_string(stage.curves) + ")";
+            if (profiler)
+                profiler->start_stage(stage_name);
 
             auto ecm_res = ecm_parallel(n, stage.curves, stage.B1, stage.B2, status_cb);
             if (ecm_res.has_value()) {
                 T f = *ecm_res;
                 auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-                auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+                auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f),
+                                                    status_cb,
+                                                    profiler);
                 factors.insert(factors.end(), sub1.begin(), sub1.end());
                 factors.insert(factors.end(), sub2.begin(), sub2.end());
                 return factors;
@@ -840,8 +863,7 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7. Финальный fallback на SIQS для больших сбалансированных чисел
-    // if (n.bit_width() <= 320) { // Не забудь включить ограничение в solver.
+    // 7. Финальный fallback на SIQS для больших чисел
     if (status_cb)
         status_cb("Запуск SIQS (факторизация через решето)...");
     if (profiler)
@@ -855,7 +877,6 @@ std::vector<T> factor_parallel_generic(T n,
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
         }
-    // }
 
     if (profiler) profiler->finish();
     factors.push_back(n);

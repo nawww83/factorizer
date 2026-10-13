@@ -401,20 +401,62 @@ public:
     std::optional<T> solve(std::function<void(const std::string&)> status_cb = nullptr) {
         m_seen_u.clear();
         uint32_t bits = m_N.bit_width();
-        // if (bits > 320) {
-        // return std::nullopt;
-        // }
 
-        // Адаптивный размер факторной базы
+        // Адаптивный размер факторной базы и интервала просеивания до 1024 бит
         size_t fb_size = 500;
-        if (bits > 120) fb_size = 900;
-        if (bits > 150) fb_size = 1600;
-        if (bits > 180) fb_size = 3000;
-        if (bits > 210) fb_size = 5000;
-        if (bits > 240) fb_size = 8500;
-        if (bits > 270) fb_size = 14000;
+        if (bits > 120)
+            fb_size = 900;
+        if (bits > 150)
+            fb_size = 1600;
+        if (bits > 180)
+            fb_size = 3000;
+        if (bits > 210)
+            fb_size = 5000;
+        if (bits > 240)
+            fb_size = 8500;
+        if (bits > 270)
+            fb_size = 14000;
+        if (bits > 300)
+            fb_size = 25000;
+        if (bits > 330)
+            fb_size = 45000;
+        if (bits > 360)
+            fb_size = 80000;
+        if (bits > 400)
+            fb_size = 150000;
+        if (bits > 450)
+            fb_size = 300000;
+        if (bits > 512)
+            fb_size = 600000;
+        if (bits > 600)
+            fb_size = 1200000;
+        if (bits > 700)
+            fb_size = 2500000;
+        if (bits > 800)
+            fb_size = 5000000;
+        if (bits > 900)
+            fb_size = 10000000;
+        if (bits > 1000)
+            fb_size = 20000000;
 
-        m_M = (bits > 200) ? 65536 : 32768;
+        // Масштабирование полудлины интервала просеивания M
+        if (bits <= 200)
+            m_M = 32768; // 32K
+        else if (bits <= 240)
+            m_M = 65536; // 64K
+        else if (bits <= 300)
+            m_M = 131072; // 128K
+        else if (bits <= 360)
+            m_M = 262144; // 256K
+        else if (bits <= 450)
+            m_M = 524288; // 512K
+        else if (bits <= 512)
+            m_M = 1048576; // 1M
+        else if (bits <= 700)
+            m_M = 2097152; // 2M
+        else
+            m_M = 4194304; // 4M
+
         m_num_relations_needed = static_cast<int>(fb_size) + 65;
 
         // 1. Построение факторной базы
