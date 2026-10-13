@@ -9,6 +9,7 @@ class FactorizerBackend : public QObject
     Q_OBJECT
     QML_ELEMENT // Регистрирует тип в модуле factorizer для использования в QML
 
+    Q_PROPERTY(bool darkMode READ isDarkMode WRITE setDarkMode NOTIFY darkModeChanged)
     Q_PROPERTY(bool isRunning READ isRunning NOTIFY isRunningChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     Q_PROPERTY(QString resultText READ resultText NOTIFY resultTextChanged)
@@ -21,14 +22,19 @@ public:
     QString statusText() const { return m_statusText; }
     QString resultText() const { return m_resultText; }
 
+    bool isDarkMode() const;
+    void setDarkMode(bool val);
+
     Q_INVOKABLE void startFactorization(const QString &numberStr, int bitWidth);
     Q_INVOKABLE void stop();
     Q_INVOKABLE QString generateRandomNumber(int bitWidth);
+    Q_INVOKABLE int getBitLength(const QString &numberStr);
 
 signals:
     void isRunningChanged();
     void statusTextChanged();
     void resultTextChanged();
+    void darkModeChanged();
 
 private:
     void setRunning(bool running);
@@ -36,6 +42,7 @@ private:
     void setResult(const QString &res);
 
     bool m_isRunning = false;
+    bool m_darkMode = true;
     std::atomic<bool> m_userStopped{false};
     QString m_statusText = "Готов к работе";
     QString m_resultText;

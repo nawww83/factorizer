@@ -1,17 +1,18 @@
 #include "factorizerbackend.h"
+#include <QElapsedTimer>
+#include <QSettings>
 #include "generic_factorizer.hpp"
 #include "u128_utils.h"
-#include <QElapsedTimer>
-#include <thread>
-#include <sstream>
-#include <vector>
-#include <map>
-#include <optional>
 #include <bit>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <random>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -154,10 +155,30 @@ ValidationResult validateInputNumber(const QString &str, int bitWidth) {
 
 } // anonymous namespace
 
-FactorizerBackend::FactorizerBackend(QObject *parent) : QObject(parent) {}
+FactorizerBackend::FactorizerBackend(QObject *parent)
+    : QObject(parent)
+{
+    QSettings s;
+    m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
+}
 
 FactorizerBackend::~FactorizerBackend() {
     stop();
+}
+
+bool FactorizerBackend::isDarkMode() const
+{
+    return m_darkMode;
+}
+
+void FactorizerBackend::setDarkMode(bool val)
+{
+    if (m_darkMode != val) {
+        m_darkMode = val;
+        QSettings s;
+        s.setValue("UI/darkMode", val);
+        emit darkModeChanged();
+    }
 }
 
 void FactorizerBackend::setRunning(bool r) {
@@ -191,6 +212,16 @@ QString FactorizerBackend::generateRandomNumber(int bitWidth) {
     default:   s = get_random_value<U128>().toString(); break;
     }
     return QString::fromStdString(s);
+}
+
+int FactorizerBackend::getBitLength(const QString &numberStr)
+{
+    // Используем существующую функцию валидации и подсчета битов (лимит 4096 бит)
+    ValidationResult val = validateInputNumber(numberStr, 4096);
+    if (!val.ok && val.bitLength == 0) {
+        return 0;
+    }
+    return static_cast<int>(val.bitLength);
 }
 
 void FactorizerBackend::stop() {
