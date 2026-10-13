@@ -125,7 +125,7 @@ public:
 
     inline T reduce(const DoubleT& z) const {
         if (z < DoubleT(m_mod)) {
-            return bignum::siqs::get_lo(z);
+            return ::u128::utils::get_lo(z);
         }
 
         // 1. q1 = z >> (k + 1)
@@ -145,7 +145,7 @@ public:
             r_wide = r_wide - DoubleT(m_mod);
         }
 
-        return bignum::siqs::get_lo(r_wide);
+        return ::u128::utils::get_lo(r_wide);
     }
 };
 
@@ -738,19 +738,36 @@ std::vector<T> factor_parallel_generic(T n,
         return factors;
     }
 
-    // 1. Пробное деление на малые простые (начиная с 3)
-    if (status_cb) status_cb("Пробное деление...");
-    if (profiler) profiler->start_stage("Пробное деление (до 65536)");
+    // generic_factorizer.hpp -> Шаг 1 (Пробное деление)
+    if (status_cb)
+        status_cb("Пробное деление...");
+    if (profiler)
+        profiler->start_stage("Пробное деление (до 65536)");
+
     auto small_primes = ::u128::utils::primes(65536);
     for (unsigned p : small_primes) {
-        if (p == 2) continue;
-        if (::u128::Globals::LoadStop()) return factors;
-        T P_val(p);
-        if (P_val * P_val > n) break;
+        if (p == 2)
+            continue;
+        if (::u128::Globals::LoadStop())
+            return factors;
 
-        while (::bignum::siqs::rem_u32(n, p) == 0) {
-            factors.push_back(P_val);
-            n = ::bignum::siqs::div_by_u32(n, p);
+        // Безопасное сравнение без умножения в типе T:
+        // если n уложилось в uint64_t и p * p > n, дальше простых делителей быть не может
+        if (n <= T(std::numeric_limits<uint64_t>::max())) {
+            uint64_t n64 = ::u128::utils::to_u64_low(n);
+            if (1ULL * p * p > n64)
+                break;
+        }
+
+        if (::bignum::siqs::rem_u32(n, p) == 0) {
+            T P_val(p);
+            do {
+                factors.push_back(P_val);
+                n = ::bignum::siqs::div_by_u32(n, p);
+            } while (::bignum::siqs::rem_u32(n, p) == 0);
+
+            if (n == T(1))
+                break;
         }
     }
 

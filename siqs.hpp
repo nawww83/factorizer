@@ -20,80 +20,12 @@
 
 namespace bignum::siqs {
 
-// --- Универсальное извлечение младших бит из любой иерархии UBig ---
-
-template <typename U>
-inline constexpr uint64_t to_u64_low(const U& val) {
-    if constexpr (std::is_integral_v<U>) {
-        return static_cast<uint64_t>(val);
-    } else if constexpr (requires { val.low(); }) {
-        return to_u64_low(val.low());
-    } else {
-        return 0;
-    }
-}
-
-template <typename U>
-inline constexpr uint32_t to_u32_low(const U& val) {
-    return static_cast<uint32_t>(to_u64_low(val));
-}
-
-// --- Извлечение половинок и сборка больших чисел ---
-
-template <typename U>
-inline constexpr auto get_hi(const U& val) {
-    if constexpr (requires { val.high(); }) {
-        return val.high();
-    } else if constexpr (requires { val.hi(); }) {
-        return val.hi();
-    } else if constexpr (std::is_same_v<U, ::bignum::u128::U128>) {
-        return to_u64_low(val >> 64);
-    }
-}
-
-template <typename U>
-inline constexpr auto get_lo(const U& val) {
-    if constexpr (requires { val.low(); }) {
-        return val.low();
-    } else if constexpr (requires { val.lo(); }) {
-        return val.lo();
-    } else if constexpr (std::is_same_v<U, ::bignum::u128::U128>) {
-        return to_u64_low(val);
-    }
-}
-
-template <typename T, typename Half>
-inline T make_big(const Half& hi, const Half& lo) {
-    if constexpr (std::is_same_v<T, ::bignum::u128::U128>) {
-        static const bool hi_first = []() {
-            ::bignum::u128::U128 test_obj{1ULL, 2ULL};
-            return (to_u64_low(test_obj) == 2ULL);
-        }();
-        if (hi_first) {
-            return ::bignum::u128::U128{hi, lo};
-        } else {
-            return ::bignum::u128::U128{lo, hi};
-        }
-    } else {
-        static const bool hi_first = []() {
-            Half test_h(1), test_l(2);
-            T test_obj(test_h, test_l);
-            return (get_lo(test_obj) == test_l);
-        }();
-        if (hi_first) {
-            return T(hi, lo);
-        } else {
-            return T(lo, hi);
-        }
-    }
-}
-
 // Быстрый хэшер больших чисел без строковой конверсии
 template <typename T>
 struct BigHash {
     size_t operator()(const T& val) const noexcept {
-        uint64_t lo = to_u64_low(val);
-        uint64_t hi = to_u64_low(get_hi(val));
+        uint64_t lo = ::u128::utils::to_u64_low(val);
+        uint64_t hi = ::u128::utils::to_u64_low(::u128::utils::get_hi(val));
         uint64_t seed = lo ^ (hi + 0x9e3779b97f4a7c15ULL + (lo << 6) + (lo >> 2));
         seed ^= (seed >> 30) * 0xbf58476d1ce4e5b9ULL;
         seed ^= (seed >> 27) * 0x94d049bb133111ebULL;
@@ -134,8 +66,8 @@ inline uint32_t rem_u32_step_generic(const T& val, uint32_t carry, uint32_t d) {
     if constexpr (std::is_integral_v<T>) {
         return rem_u32_step(static_cast<uint64_t>(val), carry, d);
     } else if constexpr (std::is_same_v<T, ::bignum::u128::U128>) {
-        uint64_t hi = get_hi(val);
-        uint64_t lo = get_lo(val);
+        uint64_t hi = ::u128::utils::get_hi(val);
+        uint64_t lo = ::u128::utils::get_lo(val);
 
         if (carry == 0 && hi == 0) {
             return static_cast<uint32_t>(lo % d);
@@ -144,9 +76,9 @@ inline uint32_t rem_u32_step_generic(const T& val, uint32_t carry, uint32_t d) {
         carry = rem_u32_step(hi, carry, d);
         return rem_u32_step(lo, carry, d);
     } else {
-        using Half = decltype(get_hi(val));
-        Half hi = get_hi(val);
-        Half lo = get_lo(val);
+        using Half = decltype(::u128::utils::get_hi(val));
+        Half hi = ::u128::utils::get_hi(val);
+        Half lo = ::u128::utils::get_lo(val);
 
         if (carry == 0 && hi == Half(0)) {
             return rem_u32_step_generic(lo, 0, d);
@@ -186,35 +118,35 @@ inline uint32_t div_mod_u32_step_generic(const T& val, uint32_t carry, uint32_t 
         out_q = static_cast<T>(q64);
         return carry;
     } else if constexpr (std::is_same_v<T, ::bignum::u128::U128>) {
-        uint64_t hi = get_hi(val);
-        uint64_t lo = get_lo(val);
+        uint64_t hi = ::u128::utils::get_hi(val);
+        uint64_t lo = ::u128::utils::get_lo(val);
         uint64_t q_hi = 0, q_lo = 0;
 
         if (carry == 0 && hi == 0) {
             carry = div_mod_u32_step(lo, 0, d, q_lo);
-            out_q = make_big<::bignum::u128::U128>(uint64_t(0), q_lo);
+            out_q = ::u128::utils::make_big<::bignum::u128::U128>(uint64_t(0), q_lo);
             return carry;
         }
 
         carry = div_mod_u32_step(hi, carry, d, q_hi);
         carry = div_mod_u32_step(lo, carry, d, q_lo);
-        out_q = make_big<::bignum::u128::U128>(q_hi, q_lo);
+        out_q = ::u128::utils::make_big<::bignum::u128::U128>(q_hi, q_lo);
         return carry;
     } else {
-        using Half = decltype(get_hi(val));
-        Half hi = get_hi(val);
-        Half lo = get_lo(val);
+        using Half = decltype(::u128::utils::get_hi(val));
+        Half hi = ::u128::utils::get_hi(val);
+        Half lo = ::u128::utils::get_lo(val);
         Half q_hi{}, q_lo{};
 
         if (carry == 0 && hi == Half(0)) {
             carry = div_mod_u32_step_generic(lo, 0, d, q_lo);
-            out_q = make_big<T>(Half(0), q_lo);
+            out_q = ::u128::utils::make_big<T>(Half(0), q_lo);
             return carry;
         }
 
         carry = div_mod_u32_step_generic(hi, carry, d, q_hi);
         carry = div_mod_u32_step_generic(lo, carry, d, q_lo);
-        out_q = make_big<T>(q_hi, q_lo);
+        out_q = ::u128::utils::make_big<T>(q_hi, q_lo);
         return carry;
     }
 }
@@ -378,6 +310,41 @@ struct SmoothRelation {
     uint64_t large_prime = 1;         // Большой делитель L (1, если чисто гладкое)
 };
 
+// Разреженное представление строки (только ненулевые позиции)
+struct SparseRow
+{
+    std::vector<uint32_t> cols; // Индексы столбцов (столбец 0: знак, 1..N: простые)
+    size_t orig_idx = 0;        // Индекс соотношения в исходном m_relations
+};
+
+// Фильтрация синглтонов (удаление простых, встретившихся ровно 1 раз)
+inline void filter_singletons(std::vector<SparseRow> &rows, size_t num_cols)
+{
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        std::vector<uint32_t> col_counts(num_cols, 0);
+        for (const auto &r : rows) {
+            for (uint32_t c : r.cols) {
+                col_counts[c]++;
+            }
+        }
+
+        // Если простой делитель встретился только в одной строке,
+        // эта строка не может войти в квадрат — удаляем её
+        auto it = std::remove_if(rows.begin(), rows.end(), [&](const SparseRow &r) {
+            for (uint32_t c : r.cols) {
+                if (col_counts[c] == 1) {
+                    changed = true;
+                    return true;
+                }
+            }
+            return false;
+        });
+        rows.erase(it, rows.end());
+    }
+}
+
 // --- Основной класс Квадратичного Решета (SIQS) ---
 
 template <typename T>
@@ -457,7 +424,7 @@ public:
         else
             m_M = 4194304; // 4M
 
-        m_num_relations_needed = static_cast<int>(fb_size) + 65;
+        m_num_relations_needed = static_cast<int>(fb_size) + std::max<int>(128, fb_size / 64);
 
         // 1. Построение факторной базы
         if (status_cb) status_cb("SIQS: Построение факторной базы...");
@@ -500,17 +467,21 @@ public:
     }
 
 private:
-    bool build_factor_base(size_t target_size) {
-        size_t prime_bound = std::max<size_t>(100000, target_size * 25);
+    bool build_factor_base(size_t target_size)
+    {
+        // Увеличиваем множитель с 25 до 65-70, так как вычетов только половина
+        size_t prime_bound = std::max<size_t>(100000, target_size * 70);
         auto all_primes = ::u128::utils::primes(prime_bound);
         m_FB.clear();
         m_FB.reserve(target_size);
 
-        m_FB.push_back({2, to_u32_low(m_N) & 1, 1});
+        m_FB.push_back({2, ::u128::utils::to_u32_low(m_N) & 1, 1});
 
         for (unsigned p : all_primes) {
-            if (p == 2) continue;
-            if (::u128::Globals::LoadStop()) return false;
+            if (p == 2)
+                continue;
+            if (::u128::Globals::LoadStop())
+                return false;
 
             uint32_t n_mod_p = rem_u32(m_N, p);
             if (n_mod_p == 0) {
@@ -521,11 +492,16 @@ private:
                 uint32_t r = tonelli_shanks_u32(n_mod_p, p);
                 uint8_t lp = static_cast<uint8_t>(std::round(std::log2(p)));
                 m_FB.push_back({p, r, lp});
-                if (m_FB.size() >= target_size) break;
+                if (m_FB.size() >= target_size)
+                    break;
             }
         }
 
-        if (m_FB.size() < target_size) return false;
+        // Защита: если чуть-чуть не дотянули до target_size, работаем с тем, что набрали
+        if (m_FB.size() < 100)
+            return false;
+        m_num_relations_needed = static_cast<int>(m_FB.size())
+                                 + std::max<int>(128, m_FB.size() / 64);
 
         uint64_t max_fb_p = m_FB.back().p;
         m_L_max = std::min<uint64_t>(max_fb_p * max_fb_p, max_fb_p * 256ULL);
@@ -533,8 +509,10 @@ private:
         return true;
     }
 
-    void sieve_worker(std::atomic<uint32_t>& batch_seed, unsigned thread_id,
-                      std::function<void(const std::string&)> status_cb) {
+    void sieve_worker(std::atomic<uint32_t> &batch_seed,
+                      unsigned thread_id,
+                      std::function<void(const std::string &)> status_cb)
+    {
         std::vector<uint8_t> sieve(2 * m_M, 0);
         size_t fb_len = m_FB.size();
 
@@ -547,10 +525,11 @@ private:
         // Оптимальный битовый размер A: A ~ sqrt(2N) / M
         uint32_t half_bits = m_N.bit_width() / 2;
         uint32_t m_log2 = static_cast<uint32_t>(std::round(std::log2(m_M)));
-        uint32_t target_a_bits = (half_bits > m_log2) ? (half_bits - m_log2) : 24;
+        uint32_t target_a_bits = (half_bits > m_log2) ? (half_bits - m_log2) : 20;
 
         // Запас для порога: log2(L_max) + 24 бита на пропущенные p <= 37 и вариацию Q(x)
-        uint8_t l_max_bits = (m_L_max > 0) ? static_cast<uint8_t>(std::round(std::log2(m_L_max))) : 0;
+        uint8_t l_max_bits = (m_L_max > 0) ? static_cast<uint8_t>(std::round(std::log2(m_L_max)))
+                                           : 0;
         uint8_t allowed_slack = l_max_bits + 24;
 
         // Предвыделенные структуры для Gray Code
@@ -570,25 +549,36 @@ private:
         while (!m_done.load(std::memory_order_relaxed) && !::u128::Globals::LoadStop()) {
             uint32_t b_id = batch_seed.fetch_add(1);
 
-            // Подбор числа простых k для Carrier Polynomials
-            size_t k_primes = 4;
-            if (target_a_bits > 45) k_primes = 5;
-            if (target_a_bits > 65) k_primes = 6;
-            if (target_a_bits > 85) k_primes = 7;
-            if (target_a_bits > 110) k_primes = 8;
+            // 1. Корректный подбор числа простых k_primes для Carrier Polynomials
+            size_t k_primes = 3;
+            if (target_a_bits >= 40)
+                k_primes = 4;
+            if (target_a_bits >= 60)
+                k_primes = 5;
+            if (target_a_bits >= 80)
+                k_primes = 6;
+            if (target_a_bits >= 105)
+                k_primes = 7;
+            if (target_a_bits >= 130)
+                k_primes = 8;
 
-            // Выбираем простые ближе к оптимуму: target_a_bits / k_primes
+            // Вычисляем целевой битовый размер одного простого множителя
             uint32_t prime_target_bits = target_a_bits / k_primes;
+            if (prime_target_bits < 10)
+                prime_target_bits = 10;
+
             size_t p_min_idx = sieve_start_idx;
-            while (p_min_idx < fb_len && m_FB[p_min_idx].log_p < prime_target_bits - 1) {
+            while (p_min_idx < fb_len && m_FB[p_min_idx].log_p < prime_target_bits) {
                 p_min_idx++;
             }
-            size_t p_max_idx = p_min_idx;
-            while (p_max_idx < fb_len && m_FB[p_max_idx].log_p <= prime_target_bits + 2) {
-                p_max_idx++;
+
+            // Гарантируем, что диапазон не выродится и содержит минимум 40 кандидатов
+            if (p_min_idx < fb_len / 10 || p_min_idx >= fb_len * 3 / 4) {
+                p_min_idx = fb_len / 8;
             }
+            size_t p_max_idx = std::min(fb_len, p_min_idx + fb_len / 3 + 40);
             if (p_max_idx <= p_min_idx) {
-                p_min_idx = fb_len / 4;
+                p_min_idx = sieve_start_idx;
                 p_max_idx = fb_len;
             }
 
@@ -598,18 +588,23 @@ private:
 
             std::fill(is_in_a.begin(), is_in_a.end(), false);
             size_t attempts = 0;
-            while (a_indices.size() < k_primes && attempts < 200) {
+            while (a_indices.size() < k_primes && attempts < 300) {
                 attempts++;
-                size_t p_idx = p_min_idx + (rng() % (p_max_idx - p_min_idx));
+                // Если попыток много, автоматически расширяем окно на всю середину базы
+                size_t cur_min = (attempts > 100) ? (fb_len / 10) : p_min_idx;
+                size_t cur_max = (attempts > 100) ? (fb_len * 4 / 5) : p_max_idx;
+
+                size_t p_idx = cur_min + (rng() % (cur_max - cur_min));
                 if (!is_in_a[p_idx]) {
                     is_in_a[p_idx] = true;
                     a_indices.push_back(p_idx);
                     A = A * T(m_FB[p_idx].p);
                 }
             }
-            if (a_indices.size() < k_primes || A == T(0)) continue;
+            if (a_indices.size() < k_primes || A == T(0))
+                continue;
 
-            // Компоненты B_i через CRT
+            // 2. Компоненты B_i через CRT
             std::vector<T> B_components(k_primes);
             for (size_t i = 0; i < k_primes; ++i) {
                 uint32_t q = m_FB[a_indices[i]].p;
@@ -623,13 +618,15 @@ private:
                 B_components[i] = M_q * T(gamma);
             }
 
-            // Предвычисление инверсий A^-1 mod p и шагов корней deltas[j][p]
+            // 3. Предвычисление инверсий A^-1 mod p и шагов deltas[j][p]
             deltas.assign(k_primes, std::vector<uint32_t>(fb_len, 0));
             for (size_t i = sieve_start_idx; i < fb_len; ++i) {
-                if (is_in_a[i]) continue;
+                if (is_in_a[i])
+                    continue;
                 uint32_t p = m_FB[i].p;
                 uint32_t a_mod = rem_u32(A, p);
-                if (a_mod == 0) continue;
+                if (a_mod == 0)
+                    continue;
                 uint32_t inv = mod_inv32(a_mod, p);
                 a_inv[i] = inv;
 
@@ -644,7 +641,8 @@ private:
 
             // Начальные корни для базового B (все знаки +1)
             for (size_t i = sieve_start_idx; i < fb_len; ++i) {
-                if (is_in_a[i]) continue;
+                if (is_in_a[i])
+                    continue;
                 uint32_t p = m_FB[i].p;
                 uint32_t r = m_FB[i].r;
                 uint32_t inv = a_inv[i];
@@ -660,9 +658,10 @@ private:
 
             size_t num_gray_polys = 1ULL << (k_primes - 1);
 
-            // Перебор 2^(k-1) полиномов по коду Грея
+            // 4. Перебор 2^(k-1) полиномов по коду Грея
             for (size_t g = 0; g < num_gray_polys; ++g) {
-                if (m_done.load(std::memory_order_relaxed) || ::u128::Globals::LoadStop()) return;
+                if (m_done.load(std::memory_order_relaxed) || ::u128::Globals::LoadStop())
+                    return;
 
                 if (g > 0) {
                     uint32_t prev_gray = (g - 1) ^ ((g - 1) >> 1);
@@ -673,10 +672,11 @@ private:
 
                     signs[v] = going_minus ? -1 : 1;
 
-                    // Обновление корней СТРОГО в Z_p (без делений и редукций mod A!)
+                    // Обновление корней в Z_p
                     if (going_minus) {
                         for (size_t i = sieve_start_idx; i < fb_len; ++i) {
-                            if (is_in_a[i]) continue;
+                            if (is_in_a[i])
+                                continue;
                             uint32_t p = m_FB[i].p;
                             uint32_t d = deltas[v][i];
                             root1[i] = (root1[i] + d >= p) ? (root1[i] + d - p) : (root1[i] + d);
@@ -684,7 +684,8 @@ private:
                         }
                     } else {
                         for (size_t i = sieve_start_idx; i < fb_len; ++i) {
-                            if (is_in_a[i]) continue;
+                            if (is_in_a[i])
+                                continue;
                             uint32_t p = m_FB[i].p;
                             uint32_t d = deltas[v][i];
                             root1[i] = (root1[i] >= d) ? (root1[i] - d) : (root1[i] + p - d);
@@ -693,12 +694,14 @@ private:
                     }
                 }
 
-                // Точное вычисление |B| и знака B в целых числах без андерфлоу
+                // Вычисление |B| и знака B
                 T B_pos = T(0);
                 T B_neg = T(0);
                 for (size_t k = 0; k < k_primes; ++k) {
-                    if (signs[k] > 0) B_pos = B_pos + B_components[k];
-                    else B_neg = B_neg + B_components[k];
+                    if (signs[k] > 0)
+                        B_pos = B_pos + B_components[k];
+                    else
+                        B_neg = B_neg + B_components[k];
                 }
 
                 T B_abs;
@@ -714,19 +717,23 @@ private:
 
                 // Просеивание массива
                 for (size_t i = sieve_start_idx; i < fb_len; ++i) {
-                    if (is_in_a[i]) continue;
+                    if (is_in_a[i])
+                        continue;
                     uint32_t p = m_FB[i].p;
                     uint8_t log_p = m_FB[i].log_p;
 
                     int start1 = (static_cast<int>(root1[i]) + m_M) % p;
                     int start2 = (static_cast<int>(root2[i]) + m_M) % p;
 
-                    for (int j = start1; j < 2 * m_M; j += p) sieve[j] += log_p;
-                    for (int j = start2; j < 2 * m_M; j += p) sieve[j] += log_p;
+                    for (int j = start1; j < 2 * m_M; j += p)
+                        sieve[j] += log_p;
+                    for (int j = start2; j < 2 * m_M; j += p)
+                        sieve[j] += log_p;
                 }
 
                 // Оценка максимального значения |Q(x)| на отрезке [-M, M]
-                T max_val = A * T(static_cast<uint64_t>(m_M) * m_M) + B_abs * T(static_cast<uint64_t>(2 * m_M)) + div_q(m_N, A);
+                T max_val = A * T(static_cast<uint64_t>(m_M) * m_M)
+                            + B_abs * T(static_cast<uint64_t>(2 * m_M)) + div_q(m_N, A);
                 uint8_t max_bits = static_cast<uint8_t>(max_val.bit_width());
                 uint8_t threshold = (max_bits > allowed_slack) ? (max_bits - allowed_slack) : 1;
 
@@ -735,7 +742,7 @@ private:
                     if (sieve[j] >= threshold) {
                         int64_t x_val = j - m_M;
 
-                        // Вычисление Y = Ax + B с учетом знака B
+                        // Вычисление Y = Ax + B
                         T Ax = A * T(static_cast<uint64_t>(std::abs(x_val)));
                         T Y_abs;
                         bool Y_is_negative = false;
@@ -744,13 +751,21 @@ private:
                             if (!B_is_negative) {
                                 Y_abs = Ax + B_abs;
                             } else {
-                                if (Ax >= B_abs) Y_abs = Ax - B_abs;
-                                else { Y_abs = B_abs - Ax; Y_is_negative = true; }
+                                if (Ax >= B_abs)
+                                    Y_abs = Ax - B_abs;
+                                else {
+                                    Y_abs = B_abs - Ax;
+                                    Y_is_negative = true;
+                                }
                             }
                         } else {
                             if (!B_is_negative) {
-                                if (B_abs >= Ax) Y_abs = B_abs - Ax;
-                                else { Y_abs = Ax - B_abs; Y_is_negative = true; }
+                                if (B_abs >= Ax)
+                                    Y_abs = B_abs - Ax;
+                                else {
+                                    Y_abs = Ax - B_abs;
+                                    Y_is_negative = true;
+                                }
                             } else {
                                 Y_abs = Ax + B_abs;
                                 Y_is_negative = true;
@@ -769,47 +784,50 @@ private:
                             rem = div_q(m_N - Y2, A);
                             is_neg = true;
                         }
-
-                        if (rem == T(0)) continue;
-
+                        if (rem == T(0))
+                            continue;
                         p_indices.clear();
                         p_powers.clear();
-
                         // Быстрое извлечение двоек
-                        if ((to_u32_low(rem) & 1) == 0) {
+                        if ((::u128::utils::to_u32_low(rem) & 1) == 0) {
                             uint16_t c2 = 0;
-                            while ((to_u32_low(rem) & 1) == 0 && rem > T(0)) {
+                            while ((::u128::utils::to_u32_low(rem) & 1) == 0 && rem > T(0)) {
                                 rem >>= 1;
                                 c2++;
                             }
                             p_indices.push_back(0);
                             p_powers.push_back(c2);
                         }
-
                         bool fits_u64 = (rem <= T(std::numeric_limits<uint64_t>::max()));
-                        uint64_t rem64 = fits_u64 ? to_u64_low(rem) : 0;
-
+                        uint64_t rem64 = fits_u64 ? ::u128::utils::to_u64_low(rem) : 0;
                         // Факторизация пробными делениями
                         for (size_t pi = 1; pi < fb_len; ++pi) {
-                            if (rem == T(1)) break;
+                            if (rem == T(1))
+                                break;
                             uint32_t p = m_FB[pi].p;
-
                             if (fits_u64) {
-                                if (rem64 == 1) break;
+                                if (rem64 == 1)
+                                    break;
                                 uint64_t p_sq = static_cast<uint64_t>(p) * p;
                                 if (rem64 < p_sq) {
                                     if (rem64 <= m_FB.back().p) {
-                                        auto it = std::lower_bound(m_FB.begin(), m_FB.end(), static_cast<uint32_t>(rem64),
-                                                                   [](const FactorBasePrime& fbp, uint32_t val) { return fbp.p < val; });
-                                        if (it != m_FB.end() && it->p == static_cast<uint32_t>(rem64)) {
-                                            p_indices.push_back(static_cast<uint32_t>(std::distance(m_FB.begin(), it)));
+                                        auto it = std::lower_bound(m_FB.begin(),
+                                                                   m_FB.end(),
+                                                                   static_cast<uint32_t>(rem64),
+                                                                   [](const FactorBasePrime &fbp,
+                                                                      uint32_t val) {
+                                                                       return fbp.p < val;
+                                                                   });
+                                        if (it != m_FB.end()
+                                            && it->p == static_cast<uint32_t>(rem64)) {
+                                            p_indices.push_back(static_cast<uint32_t>(
+                                                std::distance(m_FB.begin(), it)));
                                             p_powers.push_back(1);
                                             rem64 = 1;
                                         }
                                     }
                                     break;
                                 }
-
                                 if (rem64 % p == 0) {
                                     uint16_t count = 0;
                                     do {
@@ -826,35 +844,29 @@ private:
                                     do {
                                         count++;
                                         rem = div_by_u32(rem, p);
-                                        if (rem == T(1)) break;
+                                        if (rem == T(1))
+                                            break;
                                         r = rem_u32(rem, p);
                                     } while (r == 0);
                                     p_indices.push_back(static_cast<uint32_t>(pi));
                                     p_powers.push_back(count);
-
                                     if (rem <= T(std::numeric_limits<uint64_t>::max())) {
                                         fits_u64 = true;
-                                        rem64 = to_u64_low(rem);
+                                        rem64 = ::u128::utils::to_u64_low(rem);
                                     }
                                 }
                             }
                         }
-
                         if (fits_u64) {
                             rem = T(rem64);
                         }
-
                         bool is_smooth = (rem == T(1));
                         bool is_partial = (!is_smooth && rem <= T(m_L_max));
-
                         if (is_smooth || is_partial) {
-                            // Вычисляем u(x) = (Ax + B) mod N
                             T u_val = div_r(Y_abs, m_N);
                             if (Y_is_negative && u_val != T(0)) {
                                 u_val = m_N - u_val;
                             }
-
-                            // Сборка степеней простых
                             std::vector<std::pair<uint32_t, uint16_t>> factors;
                             factors.reserve(p_indices.size() + a_indices.size());
                             for (size_t k = 0; k < p_indices.size(); ++k) {
@@ -863,13 +875,14 @@ private:
                             for (size_t a_idx : a_indices) {
                                 factors.emplace_back(static_cast<uint32_t>(a_idx), 1);
                             }
-                            std::sort(factors.begin(), factors.end(), [](const auto& a, const auto& b) {
-                                return a.first < b.first;
-                            });
-
+                            std::sort(factors.begin(),
+                                      factors.end(),
+                                      [](const auto &a, const auto &b) {
+                                          return a.first < b.first;
+                                      });
                             std::vector<uint32_t> final_indices;
                             std::vector<uint16_t> final_powers;
-                            for (const auto& f : factors) {
+                            for (const auto &f : factors) {
                                 if (!final_indices.empty() && final_indices.back() == f.first) {
                                     final_powers.back() += f.second;
                                 } else {
@@ -877,15 +890,12 @@ private:
                                     final_powers.push_back(f.second);
                                 }
                             }
-
                             if (is_smooth) {
                                 T norm_u = (u_val > (m_N >> 1)) ? (m_N - u_val) : u_val;
-
                                 std::lock_guard<std::mutex> lock(m_rel_mutex);
                                 if (!m_seen_u.insert(norm_u).second) {
                                     continue;
                                 }
-
                                 SmoothRelation<T> rel;
                                 rel.is_negative = is_neg;
                                 rel.u = u_val;
@@ -893,26 +903,26 @@ private:
                                 rel.prime_pow = std::move(final_powers);
                                 rel.large_prime = 1;
                                 m_relations.push_back(std::move(rel));
-
-                                if (status_cb && (m_relations.size() % 10 == 0 ||
-                                                  m_relations.size() >= static_cast<size_t>(m_num_relations_needed))) {
-                                    status_cb("SIQS: Сбор соотношений: " + std::to_string(m_relations.size()) +
-                                              " / " + std::to_string(m_num_relations_needed));
+                                if (status_cb
+                                    && (m_relations.size() % 10 == 0
+                                        || m_relations.size()
+                                               >= static_cast<size_t>(m_num_relations_needed))) {
+                                    status_cb("SIQS: Сбор соотношений: "
+                                              + std::to_string(m_relations.size()) + " / "
+                                              + std::to_string(m_num_relations_needed));
                                 }
-
                                 if (static_cast<int>(m_relations.size()) >= m_num_relations_needed) {
                                     m_done.store(true, std::memory_order_relaxed);
                                     return;
                                 }
                             } else { // is_partial
-                                uint64_t L = to_u64_low(rem);
+                                uint64_t L = ::u128::utils::to_u64_low(rem);
                                 SmoothRelation<T> rel;
                                 rel.is_negative = is_neg;
                                 rel.u = u_val;
                                 rel.prime_idx = std::move(final_indices);
                                 rel.prime_pow = std::move(final_powers);
                                 rel.large_prime = L;
-
                                 SmoothRelation<T> match_rel;
                                 bool found_match = false;
                                 {
@@ -926,53 +936,58 @@ private:
                                         found_match = true;
                                     }
                                 }
-
                                 if (found_match) {
                                     SmoothRelation<T> combined;
                                     combined.u = match_rel.u;
                                     mult_mod(combined.u, rel.u, m_N);
-
-                                    T norm_comb_u = (combined.u > (m_N >> 1)) ? (m_N - combined.u) : combined.u;
-                                    combined.is_negative = (match_rel.is_negative != rel.is_negative);
+                                    T norm_comb_u = (combined.u > (m_N >> 1)) ? (m_N - combined.u)
+                                                                              : combined.u;
+                                    combined.is_negative = (match_rel.is_negative
+                                                            != rel.is_negative);
                                     combined.large_prime = L;
-
                                     std::vector<std::pair<uint32_t, uint16_t>> comb_factors;
-                                    comb_factors.reserve(match_rel.prime_idx.size() + rel.prime_idx.size());
+                                    comb_factors.reserve(match_rel.prime_idx.size()
+                                                         + rel.prime_idx.size());
                                     for (size_t k = 0; k < match_rel.prime_idx.size(); ++k) {
-                                        comb_factors.emplace_back(match_rel.prime_idx[k], match_rel.prime_pow[k]);
+                                        comb_factors.emplace_back(match_rel.prime_idx[k],
+                                                                  match_rel.prime_pow[k]);
                                     }
                                     for (size_t k = 0; k < rel.prime_idx.size(); ++k) {
-                                        comb_factors.emplace_back(rel.prime_idx[k], rel.prime_pow[k]);
+                                        comb_factors.emplace_back(rel.prime_idx[k],
+                                                                  rel.prime_pow[k]);
                                     }
-                                    std::sort(comb_factors.begin(), comb_factors.end(), [](const auto& a, const auto& b) {
-                                        return a.first < b.first;
-                                    });
-
-                                    for (const auto& f : comb_factors) {
-                                        if (!combined.prime_idx.empty() && combined.prime_idx.back() == f.first) {
+                                    std::sort(comb_factors.begin(),
+                                              comb_factors.end(),
+                                              [](const auto &a, const auto &b) {
+                                                  return a.first < b.first;
+                                              });
+                                    for (const auto &f : comb_factors) {
+                                        if (!combined.prime_idx.empty()
+                                            && combined.prime_idx.back() == f.first) {
                                             combined.prime_pow.back() += f.second;
                                         } else {
                                             combined.prime_idx.push_back(f.first);
                                             combined.prime_pow.push_back(f.second);
                                         }
                                     }
-
                                     std::lock_guard<std::mutex> lock(m_rel_mutex);
                                     if (!m_seen_u.insert(norm_comb_u).second) {
                                         continue;
                                     }
-
                                     m_relations.push_back(std::move(combined));
                                     m_combined_count++;
-
-                                    if (status_cb && (m_relations.size() % 10 == 0 ||
-                                                      m_relations.size() >= static_cast<size_t>(m_num_relations_needed))) {
-                                        status_cb("SIQS: Сбор соотношений: " + std::to_string(m_relations.size()) +
-                                                  " / " + std::to_string(m_num_relations_needed) +
-                                                  " (пар: " + std::to_string(m_combined_count) + ")");
+                                    if (status_cb
+                                        && (m_relations.size() % 10 == 0
+                                            || m_relations.size() >= static_cast<size_t>(
+                                                   m_num_relations_needed))) {
+                                        status_cb("SIQS: Сбор соотношений: "
+                                                  + std::to_string(m_relations.size()) + " / "
+                                                  + std::to_string(m_num_relations_needed)
+                                                  + " (пар: " + std::to_string(m_combined_count)
+                                                  + ")");
                                     }
-
-                                    if (static_cast<int>(m_relations.size()) >= m_num_relations_needed) {
+                                    if (static_cast<int>(m_relations.size())
+                                        >= m_num_relations_needed) {
                                         m_done.store(true, std::memory_order_relaxed);
                                         return;
                                     }
@@ -982,74 +997,111 @@ private:
                     }
                 }
             }
-
             if (b_id % 5 == 0 && thread_id == 0 && status_cb) {
-                status_cb("SIQS: Пачек полиномов: " + std::to_string(b_id) +
-                          " | Соотношений: " + std::to_string(m_relations.size()) +
-                          " / " + std::to_string(m_num_relations_needed));
+                status_cb("SIQS: Пачек полиномов: " + std::to_string(b_id)
+                          + " | Соотношений: " + std::to_string(m_relations.size()) + " / "
+                          + std::to_string(m_num_relations_needed));
             }
         }
     }
 
-    std::optional<T> solve_linear_algebra(std::function<void(const std::string&)> status_cb = nullptr) {
+    std::optional<T> solve_linear_algebra(
+        std::function<void(const std::string &)> status_cb = nullptr)
+    {
         size_t num_primes = m_FB.size();
         size_t num_rels = m_relations.size();
         if (num_rels <= num_primes) {
-            if (status_cb) status_cb("SIQS: Ошибка: недостаточно соотношений (" +
-                          std::to_string(num_rels) + " <= " + std::to_string(num_primes) + ")");
+            if (status_cb)
+                status_cb("SIQS: Ошибка: недостаточно соотношений (" + std::to_string(num_rels)
+                          + " <= " + std::to_string(num_primes) + ")");
             return std::nullopt;
         }
 
-        size_t total_cols = num_primes + 1;
-        size_t words = (total_cols + 63) / 64;
-        size_t hist_words = (num_rels + 63) / 64;
+        // 1. Построение разреженной системы
+        size_t total_cols = num_primes + 1; // 0 - знак минус, 1..num_primes - простые базы
+        std::vector<SparseRow> sparse_rows(num_rels);
 
-        struct MatrixRow {
+        for (size_t r = 0; r < num_rels; ++r) {
+            sparse_rows[r].orig_idx = r;
+            if (m_relations[r].is_negative) {
+                sparse_rows[r].cols.push_back(0);
+            }
+            for (size_t i = 0; i < m_relations[r].prime_idx.size(); ++i) {
+                if (m_relations[r].prime_pow[i] & 1) {
+                    sparse_rows[r].cols.push_back(m_relations[r].prime_idx[i] + 1);
+                }
+            }
+            std::sort(sparse_rows[r].cols.begin(), sparse_rows[r].cols.end());
+        }
+
+        // 2. Очистка от синглтонов (Structured Elimination)
+        if (status_cb)
+            status_cb("SIQS: Фильтрация матрицы (удаление синглтонов)...");
+
+        std::vector<SparseRow> filtered_rows = sparse_rows;
+        filter_singletons(filtered_rows, total_cols);
+
+        // Если после фильтрации строк осталось недостаточно, используем исходные без фильтрации!
+        bool use_filtered = (filtered_rows.size() > total_cols);
+        std::vector<SparseRow> &active_rows = use_filtered ? filtered_rows : sparse_rows;
+        size_t M = active_rows.size();
+
+        if (status_cb)
+            status_cb("SIQS: Размер матрицы для решения: " + std::to_string(M) + " x "
+                      + std::to_string(total_cols));
+
+        // 3. Компактный Гаусс над GF(2)
+        size_t words = (total_cols + 63) / 64;
+        size_t hist_words = (M + 63) / 64;
+
+        struct MatrixRow
+        {
             std::vector<uint64_t> mask;
             std::vector<uint64_t> history;
         };
 
-        std::vector<MatrixRow> matrix(num_rels);
-
-        for (size_t r = 0; r < num_rels; ++r) {
+        std::vector<MatrixRow> matrix(M);
+        for (size_t r = 0; r < M; ++r) {
             matrix[r].mask.assign(words, 0);
             matrix[r].history.assign(hist_words, 0);
             matrix[r].history[r / 64] |= (1ULL << (r % 64));
 
-            if (m_relations[r].is_negative) {
-                matrix[r].mask[0] |= 1ULL;
-            }
-
-            for (size_t i = 0; i < m_relations[r].prime_idx.size(); ++i) {
-                uint32_t col = m_relations[r].prime_idx[i] + 1;
-                if (m_relations[r].prime_pow[i] & 1) {
-                    matrix[r].mask[col / 64] ^= (1ULL << (col % 64));
-                }
+            for (uint32_t col : active_rows[r].cols) {
+                matrix[r].mask[col / 64] ^= (1ULL << (col % 64));
             }
         }
 
-        // Метод Гаусса над GF(2)
+        std::vector<size_t> orig_indices(M);
+        for (size_t r = 0; r < M; ++r) {
+            orig_indices[r] = active_rows[r].orig_idx;
+        }
+        sparse_rows.clear();
+        sparse_rows.shrink_to_fit();
+        filtered_rows.clear();
+        filtered_rows.shrink_to_fit();
+
+        // 4. Прямой и обратный ход метода Гаусса
         size_t row = 0;
-        for (size_t col = 0; col < total_cols && row < num_rels; ++col) {
+        for (size_t col = 0; col < total_cols && row < M; ++col) {
             size_t col_w = col / 64;
             uint64_t col_mask = 1ULL << (col % 64);
 
             size_t pivot = row;
-            while (pivot < num_rels && !(matrix[pivot].mask[col_w] & col_mask)) {
+            while (pivot < M && !(matrix[pivot].mask[col_w] & col_mask)) {
                 pivot++;
             }
-            if (pivot >= num_rels) continue;
+            if (pivot >= M)
+                continue;
 
             if (row != pivot) {
                 std::swap(matrix[row], matrix[pivot]);
             }
 
-            const auto& pivot_mask = matrix[row].mask;
-            const auto& pivot_hist = matrix[row].history;
+            const auto &pivot_mask = matrix[row].mask;
+            const auto &pivot_hist = matrix[row].history;
 
-            for (size_t r = 0; r < num_rels; ++r) {
+            for (size_t r = 0; r < M; ++r) {
                 if (r != row && (matrix[r].mask[col_w] & col_mask)) {
-                    // Начинаем XOR с col_w, так как предыдущие слова уже занулены
                     for (size_t w = col_w; w < words; ++w) {
                         matrix[r].mask[w] ^= pivot_mask[w];
                     }
@@ -1061,9 +1113,10 @@ private:
             row++;
         }
 
+        // 5. Поиск нулевых строк и извлечение множителей
         int null_rows_count = 0;
 
-        for (size_t r = 0; r < num_rels; ++r) {
+        for (size_t r = 0; r < M; ++r) {
             bool all_zero = true;
             for (size_t w = 0; w < words; ++w) {
                 if (matrix[r].mask[w] != 0) {
@@ -1073,38 +1126,36 @@ private:
             }
 
             if (all_zero) {
-                size_t rels_in_combination = 0;
-                for (size_t rel_idx = 0; rel_idx < num_rels; ++rel_idx) {
-                    if (matrix[r].history[rel_idx / 64] & (1ULL << (rel_idx % 64))) {
-                        rels_in_combination++;
-                    }
-                }
-
-                if (rels_in_combination < 2) {
-                    continue;
-                }
-
                 null_rows_count++;
                 T X = T(1);
                 T Y = T(1);
                 std::vector<uint64_t> combined_powers(num_primes, 0);
+                std::unordered_map<uint64_t, int> lp_counts;
 
-                for (size_t rel_idx = 0; rel_idx < num_rels; ++rel_idx) {
-                    if (matrix[r].history[rel_idx / 64] & (1ULL << (rel_idx % 64))) {
-                        mult_mod(X, m_relations[rel_idx].u, m_N);
+                size_t rels_in_combination = 0;
+                for (size_t local_idx = 0; local_idx < M; ++local_idx) {
+                    if (matrix[r].history[local_idx / 64] & (1ULL << (local_idx % 64))) {
+                        rels_in_combination++;
+                        size_t real_rel_idx = orig_indices[local_idx];
+                        const auto &rel = m_relations[real_rel_idx];
 
-                        if (m_relations[rel_idx].large_prime > 1) {
-                            T lp(m_relations[rel_idx].large_prime);
-                            mult_mod(Y, lp, m_N);
+                        mult_mod(X, rel.u, m_N);
+
+                        // Считаем кратность каждого большого простого
+                        if (rel.large_prime > 1) {
+                            lp_counts[rel.large_prime]++;
                         }
 
-                        for (size_t pi = 0; pi < m_relations[rel_idx].prime_idx.size(); ++pi) {
-                            combined_powers[m_relations[rel_idx].prime_idx[pi]] +=
-                                m_relations[rel_idx].prime_pow[pi];
+                        for (size_t pi = 0; pi < rel.prime_idx.size(); ++pi) {
+                            combined_powers[rel.prime_idx[pi]] += rel.prime_pow[pi];
                         }
                     }
                 }
 
+                if (rels_in_combination == 0)
+                    continue;
+
+                // Домножаем Y на простые из факторной базы (степень / 2)
                 for (size_t p_idx = 0; p_idx < num_primes; ++p_idx) {
                     uint64_t half_pow = combined_powers[p_idx] / 2;
                     if (half_pow > 0) {
@@ -1114,47 +1165,56 @@ private:
                     }
                 }
 
+                // Домножаем Y на большие простые (ровно в степени count, так как каждая пара уже дала L^2)
+                for (const auto &[lp_val, count] : lp_counts) {
+                    T lp(lp_val);
+                    int_power_mod(lp, T(count), m_N);
+                    mult_mod(Y, lp, m_N);
+                }
+
                 T X2 = X;
                 square_mod(X2, m_N);
                 T Y2 = Y;
                 square_mod(Y2, m_N);
 
                 if (X2 != Y2) {
-                    continue;
+                    continue; // Пропускаем только если математический баланс нарушен
                 }
 
                 if (X == Y) {
-                    continue;
+                    continue; // Тривиальный случай X - Y = 0
                 }
 
                 T diff = (X >= Y) ? (X - Y) : (Y - X);
                 T sum = div_r(X + Y, m_N);
-
-                if (sum == T(0)) {
+                if (sum == T(0))
                     continue;
-                }
 
                 T f1 = gcd_generic(diff, m_N);
                 if (f1 > T(1) && f1 < m_N) {
-                    if (status_cb) status_cb("SIQS: Успех! Найден множитель: " + f1.toString());
+                    if (status_cb)
+                        status_cb("SIQS: Успех! Найден множитель: " + f1.toString());
                     return f1;
                 }
 
                 T f2 = gcd_generic(sum, m_N);
                 if (f2 > T(1) && f2 < m_N) {
-                    if (status_cb) status_cb("SIQS: Успех! Найден множитель: " + f2.toString());
+                    if (status_cb)
+                        status_cb("SIQS: Успех! Найден множитель: " + f2.toString());
                     return f2;
                 }
             }
         }
 
         if (status_cb) {
-            status_cb("SIQS: Найдено зависимостей: " + std::to_string(null_rows_count) +
-                      ", но все дали тривиальные делители.");
+            status_cb("SIQS: Найдено зависимостей: " + std::to_string(null_rows_count)
+                      + ", но все дали тривиальные делители.");
         }
 
         return std::nullopt;
     }
+
+    ;
 };
 
 template <typename T>
