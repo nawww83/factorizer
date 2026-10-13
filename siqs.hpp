@@ -486,7 +486,7 @@ private:
         if (m_FB.size() < target_size) return false;
 
         uint64_t max_fb_p = m_FB.back().p;
-        m_L_max = std::min(max_fb_p * max_fb_p, max_fb_p * 256ULL);
+        m_L_max = std::min<uint64_t>(max_fb_p * max_fb_p, max_fb_p * 256ULL);
 
         return true;
     }
@@ -744,7 +744,7 @@ private:
                             p_powers.push_back(c2);
                         }
 
-                        bool fits_u64 = (rem <= T(0xFFFFFFFFFFFFFFFFULL));
+                        bool fits_u64 = (rem <= T(std::numeric_limits<uint64_t>::max()));
                         uint64_t rem64 = fits_u64 ? to_u64_low(rem) : 0;
 
                         // Факторизация пробными делениями
@@ -790,7 +790,7 @@ private:
                                     p_indices.push_back(static_cast<uint32_t>(pi));
                                     p_powers.push_back(count);
 
-                                    if (rem <= T(0xFFFFFFFFFFFFFFFFULL)) {
+                                    if (rem <= T(std::numeric_limits<uint64_t>::max())) {
                                         fits_u64 = true;
                                         rem64 = to_u64_low(rem);
                                     }
