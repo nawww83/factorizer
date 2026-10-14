@@ -1,7 +1,8 @@
 #pragma once
 
-#include "u128_utils.h"
+#include "gnfs.hpp"
 #include "siqs.hpp"
+#include "u128_utils.h"
 
 #include <vector>
 #include <string>
@@ -880,7 +881,7 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7. Финальный fallback на SIQS для больших чисел
+    // 7. Запуск SIQS (для чисел < 300 бит или как fallback после ECM)
     if (status_cb)
         status_cb("Запуск SIQS (факторизация через решето)...");
     if (profiler)
@@ -893,7 +894,26 @@ std::vector<T> factor_parallel_generic(T n,
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
+    }
+
+    // 8. Последний рубеж: GNFS для больших чисел (кроссовер >= 300 бит).
+    // Запускается в самом конце — после Полларда, SIQS и ECM.
+    if (n.bit_width() >= 300) {
+        if (status_cb)
+            status_cb("Запуск GNFS (Общее решето числового поля)...");
+        if (profiler)
+            profiler->start_stage("GNFS (Решето числового поля)");
+
+        auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb);
+        if (gnfs_res.has_value()) {
+            T f = *gnfs_res;
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+            factors.insert(factors.end(), sub1.begin(), sub1.end());
+            factors.insert(factors.end(), sub2.begin(), sub2.end());
+            return factors;
         }
+    }
 
     if (profiler) profiler->finish();
     factors.push_back(n);

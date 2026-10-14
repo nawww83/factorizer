@@ -38,6 +38,7 @@ qt_add_qml_module(appfactorizer
         factorizerbackend.cpp
         generic_factorizer.hpp
         siqs.hpp
+        gnfs.hpp
 )
 
 target_link_libraries(appfactorizer PRIVATE

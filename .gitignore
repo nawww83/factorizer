@@ -69,3 +69,6 @@ Testing/
 
 # Qt specific
 .qtcreator/
+
+# Qt Creator user-local settings
+CMakeLists.txt.user
