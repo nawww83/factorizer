@@ -28,6 +28,7 @@ public:
     Q_INVOKABLE void startFactorization(const QString &numberStr, int bitWidth);
     Q_INVOKABLE void stop();
     Q_INVOKABLE QString generateRandomNumber(int bitWidth);
+    Q_INVOKABLE void generateSemiprime(int bitWidth);
     Q_INVOKABLE int getBitLength(const QString &numberStr);
 
 signals:
@@ -35,6 +36,7 @@ signals:
     void statusTextChanged();
     void resultTextChanged();
     void darkModeChanged();
+    void semiprimeReady(const QString &number);
 
 private:
     void setRunning(bool running);

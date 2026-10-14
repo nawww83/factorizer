@@ -920,4 +920,125 @@ std::vector<T> factor_parallel_generic(T n,
     return factors;
 }
 
+// --- Генерация сложного числа p×q (semiprime, как в криптографии) ---
+
+namespace semiprime_detail {
+
+// Простые числа < 5000 для дешёвого пробного деления кандидатов
+inline const std::vector<uint32_t> &small_primes()
+{
+    static const std::vector<uint32_t> primes = [] {
+        std::vector<bool> sieve(5000, true);
+        sieve[0] = sieve[1] = false;
+        for (uint32_t i = 2; i * i < 5000; ++i) {
+            if (sieve[i]) {
+                for (uint32_t j = i * i; j < 5000; j += i)
+                    sieve[j] = false;
+            }
+        }
+        std::vector<uint32_t> res;
+        for (uint32_t i = 2; i < 5000; ++i) {
+            if (sieve[i])
+                res.push_back(i);
+        }
+        return res;
+    }();
+    return primes;
+}
+
+} // namespace semiprime_detail
+
+// Генерирует сложное число p×q ровно bitWidth бит: оба сомножителя простые,
+// каждое длиной ровно bitWidth/2 бит, p != q.
+// При срабатывании остановки (Globals::LoadStop) возвращает T(0).
+// progress-колбэк получает число проверенных кандидатов (вызывается нечасто).
+template <typename T>
+T generate_semiprime(unsigned bitWidth,
+                     T *p_out = nullptr,
+                     T *q_out = nullptr,
+                     const std::function<void(uint64_t)> &progress = nullptr)
+{
+    const unsigned half = bitWidth / 2;
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist;
+
+    // Случайное нечётное число с установленным старшим битом (ровно `bits` бит)
+    auto random_odd = [&](unsigned bits) {
+        T val(0);
+        for (unsigned made = 0; made < bits; made += 64) {
+            unsigned take = std::min(64u, bits - made);
+            uint64_t chunk = dist(rng);
+            if (take < 64)
+                chunk &= (1ULL << take) - 1;
+
+            val = (val << take) | T(chunk);
+        }
+        return val | (T(1) << (bits - 1)) | T(1);
+    };
+
+    // Дешёвый предварительный отсев: пробное деление по простым < 5000
+    auto cheap_composite_check = [](const T &cand) {
+        for (uint32_t sp : semiprime_detail::small_primes()) {
+            if (cand <= T(sp))
+                return false; // малое число — дальше решает Миллер—Рабин
+
+            if (::bignum::siqs::rem_u32(cand, sp) == 0)
+                return true; // делится — составное
+        }
+        return false;
+    };
+
+    // Поиск простого длиной ровно `half` бит
+    auto find_prime = [&](T &out) {
+        for (;;) {
+            if (::u128::Globals::LoadStop())
+                return false;
+
+            out = random_odd(half);
+            if (cheap_composite_check(out) || !is_prime_generic(out, 3))
+                continue;
+
+            return true;
+        }
+    };
+
+    uint64_t candidates = 0;
+    for (;;) {
+        T p, q;
+        if (!find_prime(p))
+            return T(0);
+
+        // Ищем второе простое: q != p и p*q имеет ровно bitWidth бит
+        for (;;) {
+            if (::u128::Globals::LoadStop())
+                return T(0);
+
+            q = random_odd(half);
+            ++candidates;
+            if (progress && (candidates % 512) == 0)
+                progress(candidates);
+
+            if (q == p || cheap_composite_check(q) || !is_prime_generic(q, 3))
+                continue;
+
+            if ((p * q).bit_width() == bitWidth)
+                break; // оба простых, произведение — точно bitWidth бит
+        }
+
+        // Финальная проверка с высокой надёжностью (k=25, ложноположительное ~1e-15)
+        if (!is_prime_generic(p, 25) || !is_prime_generic(q, 25))
+            continue; // редчайшее ложное срабатывание фильтра — новая попытка
+
+        if (progress)
+            progress(candidates);
+
+        if (p_out)
+            *p_out = p;
+        if (q_out)
+            *q_out = q;
+
+        return p * q;
+    }
+}
+
 } // namespace bignum::generic_ecm

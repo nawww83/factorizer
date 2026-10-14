@@ -214,6 +214,49 @@ QString FactorizerBackend::generateRandomNumber(int bitWidth) {
     return QString::fromStdString(s);
 }
 
+void FactorizerBackend::generateSemiprime(int bitWidth) {
+    if (m_isRunning) return;
+
+    setRunning(true);
+    setStatus(QString("Генерация сложного числа p×q (%1 бит)...").arg(bitWidth));
+
+    m_userStopped.store(false);
+    ::u128::Globals::SetStop(false);
+
+    std::thread([this, bitWidth]() {
+        using namespace bignum::generic_ecm;
+
+        auto progress = [this, bitWidth](uint64_t candidates) {
+            setStatus(QString("Генерация p×q (%1 бит): проверено кандидатов: %2...")
+                          .arg(bitWidth)
+                          .arg(candidates));
+        };
+
+        std::string s;
+        switch (bitWidth) {
+        case 128:  s = generate_semiprime<U128>(128, nullptr, nullptr, progress).toString(); break;
+        case 256:  s = generate_semiprime<U256>(256, nullptr, nullptr, progress).toString(); break;
+        case 512:  s = generate_semiprime<U512>(512, nullptr, nullptr, progress).toString(); break;
+        case 1024: s = generate_semiprime<U1024>(1024, nullptr, nullptr, progress).toString(); break;
+        case 2048: s = generate_semiprime<U2048>(2048, nullptr, nullptr, progress).toString(); break;
+        case 4096: s = generate_semiprime<U4096>(4096, nullptr, nullptr, progress).toString(); break;
+        default:   s = generate_semiprime<U128>(128, nullptr, nullptr, progress).toString(); break;
+        }
+
+        bool cancelled = ::u128::Globals::LoadStop();
+        setRunning(false);
+
+        if (!cancelled && s != "0") {
+            setStatus("Генерация завершена: сложное число p×q готово");
+            emit semiprimeReady(QString::fromStdString(s));
+        } else if (cancelled) {
+            setStatus("Генерация остановлена пользователем");
+        } else {
+            setStatus("Генерация не удалась");
+        }
+    }).detach();
+}
+
 int FactorizerBackend::getBitLength(const QString &numberStr)
 {
     // Используем существующую функцию валидации и подсчета битов (лимит 4096 бит)

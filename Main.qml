@@ -209,6 +209,27 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
 
+            // Генерация сложного числа p×q (semiprime) заданной разрядности
+            Button {
+                text: "🔐 Сложное число p×q"
+                implicitHeight: 28
+                enabled: !backend.isRunning
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: backend.generateSemiprime(bitCombo.currentValue)
+            }
+
+        }
+
+        // Получение сгенерированного сложного числа из бэкенда
+        Connections {
+            target: backend
+
+            function onSemiprimeReady(number) {
+                if (groupDigitsSwitch.checked)
+                    inputField.text = formatDigitsByGroups(number, 10);
+                else
+                    inputField.text = number;
+            }
         }
 
         // --- 3. Заголовок ввода и кнопки быстрого действия ---
