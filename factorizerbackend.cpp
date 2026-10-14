@@ -160,6 +160,7 @@ FactorizerBackend::FactorizerBackend(QObject *parent)
 {
     QSettings s;
     m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
+    m_skipEcm = s.value("Algorithms/skipEcm", false).toBool(); // по умолчанию false
 }
 
 FactorizerBackend::~FactorizerBackend() {
@@ -178,6 +179,16 @@ void FactorizerBackend::setDarkMode(bool val)
         QSettings s;
         s.setValue("UI/darkMode", val);
         emit darkModeChanged();
+    }
+}
+
+void FactorizerBackend::setSkipEcm(bool val)
+{
+    if (m_skipEcm != val) {
+        m_skipEcm = val;
+        QSettings s;
+        s.setValue("Algorithms/skipEcm", val);
+        emit skipEcmChanged();
     }
 }
 
@@ -218,7 +229,7 @@ void FactorizerBackend::generateSemiprime(int bitWidth) {
     if (m_isRunning) return;
 
     setRunning(true);
-    setStatus(QString("Генерация сложного числа p×q (%1 бит)...").arg(bitWidth));
+    setStatus(QString("Генерация полупростого числа: p×q (%1 бит)...").arg(bitWidth));
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
@@ -227,7 +238,7 @@ void FactorizerBackend::generateSemiprime(int bitWidth) {
         using namespace bignum::generic_ecm;
 
         auto progress = [this, bitWidth](uint64_t candidates) {
-            setStatus(QString("Генерация p×q (%1 бит): проверено кандидатов: %2...")
+            setStatus(QString("Генерация полупростого числа p×q (%1 бит): проверено кандидатов: %2...")
                           .arg(bitWidth)
                           .arg(candidates));
         };
@@ -247,7 +258,7 @@ void FactorizerBackend::generateSemiprime(int bitWidth) {
         setRunning(false);
 
         if (!cancelled && s != "0") {
-            setStatus("Генерация завершена: сложное число p×q готово");
+            setStatus("Генерация завершена: полупростое число p×q готово");
             emit semiprimeReady(QString::fromStdString(s));
         } else if (cancelled) {
             setStatus("Генерация остановлена пользователем");
@@ -285,14 +296,18 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
 
     setRunning(true);
     setResult("");
-    setStatus(QString("Выполняется факторизация (%1 бит)...").arg(val.bitLength));
+
+    const bool skipEcm = m_skipEcm;
+    setStatus(QString("Выполняется факторизация (%1 бит)%2...")
+                  .arg(val.bitLength)
+                  .arg(skipEcm ? ", ECM пропущен" : ""));
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
 
     std::string stdStr = numberStr.trimmed().toStdString();
 
-    std::thread([this, stdStr, bitWidth]() {
+    std::thread([this, stdStr, bitWidth, skipEcm]() {
         using namespace bignum::generic_ecm;
         QElapsedTimer timer;
         timer.start();
@@ -340,7 +355,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             switch (bitWidth) {
             case 128: {
                 U128 val = U128::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -348,7 +363,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
             case 256: {
                 U256 val = U256::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -356,7 +371,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
             case 512: {
                 U512 val = U512::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -364,7 +379,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
             case 1024: {
                 U1024 val = U1024::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -372,7 +387,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
             case 2048: {
                 U2048 val = U2048::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -380,7 +395,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
             case 4096: {
                 U4096 val = U4096::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);

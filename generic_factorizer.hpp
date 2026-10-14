@@ -716,11 +716,18 @@ std::optional<T> ecm_parallel(const T& n,
 }
 
 // --- 4. Главный конвейер факторизации ---
+// skip_ecm = true: лестница ECM пропускается (удобно для полупростых чисел p×q —
+// после методов Полларда сразу запускаются решета SIQS/GNFS).
+//
+// Кроссовер SIQS/GNFS ≈ 320 бит: до него быстрее квадратичное решето,
+// начиная с него — общее решето числового поля (GNFS).
+constexpr unsigned kSiqsGnfsCrossoverBits = 320;
 
 template <typename T>
 std::vector<T> factor_parallel_generic(T n,
                                        std::function<void(const std::string&)> status_cb = nullptr,
-                                       ::bignum::StageProfiler* profiler = nullptr) {
+                                       ::bignum::StageProfiler* profiler = nullptr,
+                                       bool skip_ecm = false) {
     std::vector<T> factors;
 
     if (n <= T(1)) return factors;
@@ -790,8 +797,8 @@ std::vector<T> factor_parallel_generic(T n,
     auto pm1_res = pollard_pm1(n, 50000);
     if (pm1_res.has_value()) {
         T f = *pm1_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -802,8 +809,8 @@ std::vector<T> factor_parallel_generic(T n,
     if (profiler) profiler->start_stage("Pollard-Brent rho");
     T f_rho = ::bignum::generic_ecm::pollard_brent_rho(n, 200000);
     if (f_rho > T(1) && f_rho < n) {
-        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f_rho), status_cb, profiler);
+        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f_rho), status_cb, profiler, skip_ecm);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -816,16 +823,17 @@ std::vector<T> factor_parallel_generic(T n,
         auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
         if (siqs_res.has_value()) {
             T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
             factors.insert(factors.end(), sub1.begin(), sub1.end());
             factors.insert(factors.end(), sub2.begin(), sub2.end());
             return factors;
         }
     }
 
-    // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит
-    if (n.bit_width() > 135) {
+    // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит.
+    // При skip_ecm (полупростые числа) ECM пропускается целиком — сразу решето.
+    if (!skip_ecm && n.bit_width() > 135) {
         struct EcmStage
         {
             unsigned curves;
@@ -870,10 +878,11 @@ std::vector<T> factor_parallel_generic(T n,
             auto ecm_res = ecm_parallel(n, stage.curves, stage.B1, stage.B2, status_cb);
             if (ecm_res.has_value()) {
                 T f = *ecm_res;
-                auto sub1 = factor_parallel_generic(f, status_cb, profiler);
+                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
                 auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f),
                                                     status_cb,
-                                                    profiler);
+                                                    profiler,
+                                                    skip_ecm);
                 factors.insert(factors.end(), sub1.begin(), sub1.end());
                 factors.insert(factors.end(), sub2.begin(), sub2.end());
                 return factors;
@@ -881,24 +890,26 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7. Запуск SIQS (для чисел < 300 бит или как fallback после ECM)
-    if (status_cb)
-        status_cb("Запуск SIQS (факторизация через решето)...");
-    if (profiler)
-        profiler->start_stage("SIQS (Квадратичное решето)");
-    auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
-    if (siqs_res.has_value()) {
-        T f = *siqs_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
-        factors.insert(factors.end(), sub1.begin(), sub1.end());
-        factors.insert(factors.end(), sub2.begin(), sub2.end());
-        return factors;
+    // 7. SIQS для чисел меньше кроссовера (~320 бит): на этих размерах он быстрее GNFS.
+    if (n.bit_width() < kSiqsGnfsCrossoverBits) {
+        if (status_cb)
+            status_cb("Запуск SIQS (факторизация через решето)...");
+        if (profiler)
+            profiler->start_stage("SIQS (Квадратичное решето)");
+        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
+        if (siqs_res.has_value()) {
+            T f = *siqs_res;
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+            factors.insert(factors.end(), sub1.begin(), sub1.end());
+            factors.insert(factors.end(), sub2.begin(), sub2.end());
+            return factors;
+        }
     }
 
-    // 8. Последний рубеж: GNFS для больших чисел (кроссовер >= 300 бит).
-    // Запускается в самом конце — после Полларда, SIQS и ECM.
-    if (n.bit_width() >= 300) {
+    // 8. GNFS для чисел >= кроссовера (~320 бит): быстрее SIQS, поэтому запускается
+    // вместо него (при skip_ecm — сразу после методов Полларда, без ECM).
+    if (n.bit_width() >= kSiqsGnfsCrossoverBits) {
         if (status_cb)
             status_cb("Запуск GNFS (Общее решето числового поля)...");
         if (profiler)
@@ -907,8 +918,8 @@ std::vector<T> factor_parallel_generic(T n,
         auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb);
         if (gnfs_res.has_value()) {
             T f = *gnfs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler);
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
             factors.insert(factors.end(), sub1.begin(), sub1.end());
             factors.insert(factors.end(), sub2.begin(), sub2.end());
             return factors;
@@ -920,7 +931,7 @@ std::vector<T> factor_parallel_generic(T n,
     return factors;
 }
 
-// --- Генерация сложного числа p×q (semiprime, как в криптографии) ---
+// --- Генерация полупростого числа p×q (semiprime, как в криптографии) ---
 
 namespace semiprime_detail {
 
@@ -948,7 +959,7 @@ inline const std::vector<uint32_t> &small_primes()
 
 } // namespace semiprime_detail
 
-// Генерирует сложное число p×q ровно bitWidth бит: оба сомножителя простые,
+// Генерирует полупростое число p×q ровно bitWidth бит: оба сомножителя простые,
 // каждое длиной ровно bitWidth/2 бит, p != q.
 // При срабатывании остановки (Globals::LoadStop) возвращает T(0).
 // progress-колбэк получает число проверенных кандидатов (вызывается нечасто).

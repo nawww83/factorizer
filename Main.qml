@@ -211,7 +211,7 @@ ApplicationWindow {
 
             // Генерация сложного числа p×q (semiprime) заданной разрядности
             Button {
-                text: "🔐 Сложное число p×q"
+                text: "🔐 Полупростое число: p×q"
                 implicitHeight: 28
                 enabled: !backend.isRunning
                 Layout.alignment: Qt.AlignVCenter
@@ -340,6 +340,27 @@ ApplicationWindow {
                     leftPadding: groupDigitsSwitch.indicator.width + groupDigitsSwitch.spacing
                 }
 
+            }
+
+            // Переключатель пропуска алгоритма ECM
+            Switch {
+                id: skipEcmSwitch
+
+                text: "Пропускать ECM"
+                checked: backend.skipEcm
+                enabled: !backend.isRunning
+                onToggled: backend.skipEcm = checked
+
+                contentItem: Text {
+                    text: skipEcmSwitch.text
+                    font: skipEcmSwitch.font
+                    color: skipEcmSwitch.enabled ? colTextPrimary : colTextSecondary
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: skipEcmSwitch.indicator.width + skipEcmSwitch.spacing
+                }
+
+                ToolTip.visible: hovered
+                ToolTip.text: "Для полупростых чисел (p×q): ECM пропускается,\nсразу работает решето (SIQS/GNFS).\nМетоды Полларда продолжают работать."
             }
 
             Item {
