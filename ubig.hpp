@@ -4,7 +4,6 @@
 #include "u128_intrinsics.hpp"
 #include <string>
 #include <iostream>
-#include <algorithm>
 #include <type_traits>
 
 namespace bignum {
@@ -186,22 +185,51 @@ public:
     UBig& operator>>=(unsigned s)   { return *this = *this >> s; }
 
     // --- Деление ---
-
-    template <bool need_q = true, bool need_r = true>
-    static UBig divide(const UBig& num, const UBig& den, UBig* rem_out = nullptr) {
+    template<bool need_q = true, bool need_r = true>
+    static UBig divide(const UBig &num, const UBig &den, UBig *rem_out = nullptr)
+    {
         if (den == UBig(0)) {
-            if (rem_out) *rem_out = UBig(0);
+            if (rem_out)
+                *rem_out = UBig(0);
             return UBig(0);
         }
         if (num < den) {
-            if (rem_out) *rem_out = num;
+            if (rem_out)
+                *rem_out = num;
             return UBig(0);
         }
         if (num == den) {
-            if (rem_out) *rem_out = UBig(0);
+            if (rem_out)
+                *rem_out = UBig(0);
             return UBig(1);
         }
 
+        // 1. Аппаратный путь для чисел до 64 бит
+        if (num.fits_u64() && den.fits_u64()) {
+            uint64_t n64 = num.to_u64();
+            uint64_t d64 = den.to_u64();
+            if constexpr (need_r) {
+                if (rem_out)
+                    *rem_out = UBig(n64 % d64);
+            }
+            return UBig(n64 / d64);
+        }
+
+        // 2. Рекурсивный спуск: если оба числа помещаются в Half,
+        // сразу передаем в Half::divide (для U256 это аппаратный __int128 в U128)
+        if (num.high() == Half(0) && den.high() == Half(0)) {
+            Half r_half(0);
+            Half q_half = Half::template divide<need_q, need_r>(num.low(),
+                                                                den.low(),
+                                                                need_r ? &r_half : nullptr);
+            if constexpr (need_r) {
+                if (rem_out)
+                    *rem_out = UBig(r_half);
+            }
+            return UBig(q_half);
+        }
+
+        // 3. Быстрое побитовое деление
         uint32_t shift = num.bit_width() - den.bit_width();
         UBig current_den = den << shift;
         UBig rem = num;
@@ -211,14 +239,22 @@ public:
             if (rem >= current_den) {
                 rem = rem - current_den;
                 if constexpr (need_q) {
-                    q = q | (UBig(1) << i);
+                    // Прямой битовый сдвиг: ставим бит без сдвига UBig(1) << i
+                    if (i >= static_cast<int>(Half::BITS)) {
+                        // Бит попадает в старшую половину
+                        q.m_hi = q.m_hi | (Half(1) << (i - Half::BITS));
+                    } else {
+                        // Бит попадает в младшую половину
+                        q.m_lo = q.m_lo | (Half(1) << i);
+                    }
                 }
             }
             current_den = current_den >> 1;
         }
 
         if constexpr (need_r) {
-            if (rem_out) *rem_out = rem;
+            if (rem_out)
+                *rem_out = rem;
         }
         return q;
     }
@@ -234,37 +270,117 @@ public:
     UBig& operator/=(const UBig& o);
     UBig& operator%=(const UBig& o);
 
-    static UBig fromString(const std::string& str) {
+    static UBig fromString(const std::string &str)
+    {
         UBig result(0);
         size_t idx = 0;
-        while (idx < str.size() && (str[idx] == ' ' || str[idx] == '\t' || str[idx] == '\n')) {
+
+        // 1. Пропуск начальных пробелов
+        while (idx < str.size()
+               && (str[idx] == ' ' || str[idx] == '\t' || str[idx] == '\n' || str[idx] == '\r')) {
             idx++;
         }
-        for (; idx < str.size(); ++idx) {
-            char c = str[idx];
-            if (c >= '0' && c <= '9') {
-                result = result * UBig(10) + UBig(static_cast<uint64_t>(c - '0'));
-            } else {
-                break;
-            }
+
+        // 2. Пропуск знака '+'
+        if (idx < str.size() && str[idx] == '+') {
+            idx++;
         }
+
+        // Степени десятки от 10^0 до 10^18 для аппаратного uint64_t
+        static constexpr uint64_t POW10[] = {
+            1ULL,
+            10ULL,
+            100ULL,
+            1'000ULL,
+            10'000ULL,
+            100'000ULL,
+            1'000'000ULL,
+            10'000'000ULL,
+            100'000'000ULL,
+            1'000'000'000ULL,
+            10'000'000'000ULL,
+            100'000'000'000ULL,
+            1'000'000'000'000ULL,
+            10'000'000'000'000ULL,
+            100'000'000'000'000ULL,
+            1'000'000'000'000'000ULL,
+            10'000'000'000'000'000ULL,
+            100'000'000'000'000'000ULL,
+            1'000'000'000'000'000'000ULL // 10^18
+        };
+
+        while (idx < str.size()) {
+            uint64_t chunk = 0;
+            size_t count = 0;
+
+            // Набираем до 18 цифр в обычный 64-битный регистр
+            while (idx < str.size() && count < 18) {
+                char c = str[idx];
+                if (c >= '0' && c <= '9') {
+                    chunk = chunk * 10 + static_cast<uint64_t>(c - '0');
+                    count++;
+                    idx++;
+                } else {
+                    break;
+                }
+            }
+
+            if (count == 0) {
+                break; // Встретился нецифровой символ
+            }
+
+            // Одно длинное умножение и сложение на каждые 18 цифр
+            result = result * UBig(POW10[count]) + UBig(chunk);
+        }
+
         return result;
     }
 
-    std::string toString() const {
-        if (*this == UBig(0)) return "0";
+    std::string toString() const
+    {
+        if (*this == UBig(0))
+            return "0";
+
+        // Быстрый выход для чисел, помещающихся в стандартный 64-битный int
+        if (this->fits_u64()) {
+            return std::to_string(this->to_u64());
+        }
+
+        static constexpr uint64_t BASE18 = 1'000'000'000'000'000'000ULL; // 10^18
+        const UBig base_big(BASE18);
+
         std::string s;
         UBig cur = *this;
+
         while (cur > UBig(0)) {
+            // Если осталась только младшая половина Half, передаем форматирование ей
+            if (cur.high() == Half(0)) {
+                std::string head = cur.low().toString();
+                return head + s;
+            }
+
             UBig rem(0);
-            cur = divide<true, true>(cur, UBig(10), &rem);
-            s.push_back(static_cast<char>('0' + rem.to_u64()));
+            cur = divide<true, true>(cur, base_big, &rem);
+            uint64_t chunk_val = rem.to_u64();
+
+            // Переводим 64-битный остаток в строку
+            std::string chunk = std::to_string(chunk_val);
+
+            // Если частное еще не ноль, выравниваем блок ведущими нулями ровно до 18 знаков
+            if (cur > UBig(0)) {
+                if (chunk.size() < 18) {
+                    chunk = std::string(18 - chunk.size(), '0') + chunk;
+                }
+            }
+
+            s = chunk + s;
         }
-        std::reverse(s.begin(), s.end());
+
         return s;
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const UBig& val) {
+    friend std::ostream &operator<<(std::ostream &os, const UBig &val)
+    {
         return os << val.toString();
     }
 };

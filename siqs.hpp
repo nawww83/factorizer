@@ -94,7 +94,14 @@ inline uint32_t rem_u32(const T& val, uint32_t d) {
     return rem_u32_step_generic(val, 0, d);
 }
 
-inline uint32_t div_mod_u32_step(uint64_t val, uint32_t carry, uint32_t d, uint64_t& out_q) {
+inline uint32_t div_mod_u32_step(uint64_t val, uint32_t carry, uint32_t d, uint64_t &out_q)
+{
+#if defined(__SIZEOF_INT128__)
+    // Одно аппаратное 128-битное деление процессора (инструкция DIV на x86_64)
+    unsigned __int128 cur = (static_cast<unsigned __int128>(carry) << 64) | val;
+    out_q = static_cast<uint64_t>(cur / d);
+    return static_cast<uint32_t>(cur % d);
+#else
     uint32_t hi = static_cast<uint32_t>(val >> 32);
     uint32_t lo = static_cast<uint32_t>(val);
 
@@ -108,6 +115,7 @@ inline uint32_t div_mod_u32_step(uint64_t val, uint32_t carry, uint32_t d, uint6
 
     out_q = (static_cast<uint64_t>(q_hi) << 32) | q_lo;
     return carry;
+#endif
 }
 
 template <typename T>
@@ -159,17 +167,29 @@ inline T div_by_u32(const T& val, uint32_t d) {
 }
 
 // --- Универсальные операции общего деления UBig ---
-
-template <typename T>
-inline constexpr std::pair<T, T> div_rem(const T& a, const T& b) {
-    if constexpr (requires { { a / b } -> std::same_as<std::pair<T, T>>; }) {
-        return a / b;
-    } else if constexpr (requires { T::template divide<true, true>(a, b, (T*)nullptr); }) {
-        T r;
+template<typename T>
+inline constexpr std::pair<T, T> div_rem(const T &a, const T &b)
+{
+    // 1. Проверяем, возвращает ли a / b структуру с полями first и second
+    // (Это покрывает UBig::DivResult, U128::DivResult и ULOW::operator/, возвращающий std::pair)
+    if constexpr (requires {
+                      { (a / b).first } -> std::convertible_to<T>;
+                      { (a / b).second } -> std::convertible_to<T>;
+                  }) {
+        auto res = a / b;
+        return {res.first, res.second};
+    }
+    // 2. Проверяем наличие статического метода divide<true, true>
+    else if constexpr (requires(T *ptr) {
+                           { T::template divide<true, true>(a, b, ptr) } -> std::convertible_to<T>;
+                       }) {
+        T r(0);
         T q = T::template divide<true, true>(a, b, &r);
         return {q, r};
-    } else {
-        return { a / b, a % b };
+    }
+    // 3. Базовые типы (uint64_t, __int128 и т.д.)
+    else {
+        return {a / b, a % b};
     }
 }
 

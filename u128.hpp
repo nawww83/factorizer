@@ -1,11 +1,8 @@
 #pragma once
 
-#include "u128_intrinsics.hpp"
 #include <cstdint>
 #include <string>
 #include <iostream>
-#include <algorithm>
-#include <utility>
 #include <bit>
 
 namespace bignum::u128 {
@@ -242,38 +239,116 @@ public:
     U128& operator%=(const U128& o);
 
     // --- Строки ---
-
-    static U128 fromString(const std::string& str) {
+    static U128 fromString(const std::string &str)
+    {
         U128 result(0);
         size_t idx = 0;
-        while (idx < str.size() && (str[idx] == ' ' || str[idx] == '\t' || str[idx] == '\n')) {
+        while (idx < str.size()
+               && (str[idx] == ' ' || str[idx] == '\t' || str[idx] == '\n' || str[idx] == '\r')) {
             idx++;
         }
-        for (; idx < str.size(); ++idx) {
-            char c = str[idx];
-            if (c >= '0' && c <= '9') {
-                result = result * U128(10) + U128(static_cast<uint64_t>(c - '0'));
-            } else {
-                break;
+        if (idx < str.size() && str[idx] == '+') {
+            idx++;
+        }
+
+        static constexpr uint64_t POW10[] = {1ULL,
+                                             10ULL,
+                                             100ULL,
+                                             1'000ULL,
+                                             10'000ULL,
+                                             100'000ULL,
+                                             1'000'000ULL,
+                                             10'000'000ULL,
+                                             100'000'000ULL,
+                                             1'000'000'000ULL,
+                                             10'000'000'000ULL,
+                                             100'000'000'000ULL,
+                                             1'000'000'000'000ULL,
+                                             10'000'000'000'000ULL,
+                                             100'000'000'000'000ULL,
+                                             1'000'000'000'000'000ULL,
+                                             10'000'000'000'000'000ULL,
+                                             100'000'000'000'000'000ULL,
+                                             1'000'000'000'000'000'000ULL};
+
+        while (idx < str.size()) {
+            uint64_t chunk = 0;
+            size_t count = 0;
+            while (idx < str.size() && count < 18) {
+                char c = str[idx];
+                if (c >= '0' && c <= '9') {
+                    chunk = chunk * 10 + static_cast<uint64_t>(c - '0');
+                    count++;
+                    idx++;
+                } else {
+                    break;
+                }
             }
+            if (count == 0)
+                break;
+            result = result * U128(POW10[count]) + U128(chunk);
         }
         return result;
     }
 
-    std::string toString() const {
-        if (*this == U128(0)) return "0";
+    std::string toString() const
+    {
+        if (*this == U128(0))
+            return "0";
+        if (fits_u64()) {
+            return std::to_string(to_u64());
+        }
+
+#if defined(__SIZEOF_INT128__)
+        // Аппаратный путь через unsigned __int128:
+        // Разбиваем 128 бит максимум на 3 блока по 10^18
+        constexpr unsigned __int128 BASE18 = 1'000'000'000'000'000'000ULL;
+        unsigned __int128 val = (static_cast<unsigned __int128>(m_hi) << 64) | m_lo;
+
+        uint64_t r0 = static_cast<uint64_t>(val % BASE18);
+        val /= BASE18;
+        uint64_t r1 = static_cast<uint64_t>(val % BASE18);
+        uint64_t r2 = static_cast<uint64_t>(val / BASE18);
+
+        std::string s;
+        if (r2 > 0) {
+            s += std::to_string(r2);
+            std::string s1 = std::to_string(r1);
+            s += std::string(18 - s1.size(), '0') + s1;
+            std::string s0 = std::to_string(r0);
+            s += std::string(18 - s0.size(), '0') + s0;
+        } else if (r1 > 0) {
+            s += std::to_string(r1);
+            std::string s0 = std::to_string(r0);
+            s += std::string(18 - s0.size(), '0') + s0;
+        } else {
+            s += std::to_string(r0);
+        }
+        return s;
+#else
+        static constexpr uint64_t BASE18 = 1'000'000'000'000'000'000ULL;
+        const U128 base_val(BASE18);
         std::string s;
         U128 cur = *this;
+
         while (cur > U128(0)) {
+            if (cur.fits_u64()) {
+                return std::to_string(cur.to_u64()) + s;
+            }
             U128 rem(0);
-            cur = divide<true, true>(cur, U128(10), &rem);
-            s.push_back(static_cast<char>('0' + rem.low()));
+            cur = divide<true, true>(cur, base_val, &rem);
+            std::string chunk = std::to_string(rem.low());
+            if (cur > U128(0) && chunk.size() < 18) {
+                chunk = std::string(18 - chunk.size(), '0') + chunk;
+            }
+            s = chunk + s;
         }
-        std::reverse(s.begin(), s.end());
         return s;
+#endif
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const U128& val) {
+    friend std::ostream &operator<<(std::ostream &os, const U128 &val)
+    {
         return os << val.toString();
     }
 };
