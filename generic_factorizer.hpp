@@ -960,7 +960,8 @@ inline const std::vector<uint32_t> &small_primes()
 } // namespace semiprime_detail
 
 // Генерирует полупростое число p×q ровно bitWidth бит: оба сомножителя простые,
-// каждое длиной ровно bitWidth/2 бит, p != q.
+// p длиной ровно bitWidth/2 бит, q — ровно bitWidth - bitWidth/2 бит (при нечётной
+// bitWidth на один бит длиннее p), p != q.
 // При срабатывании остановки (Globals::LoadStop) возвращает T(0).
 // progress-колбэк получает число проверенных кандидатов (вызывается нечасто).
 template <typename T>
@@ -970,7 +971,20 @@ T generate_semiprime(unsigned bitWidth,
                      const std::function<void(uint64_t)> &progress = nullptr,
                      uint64_t seed = 0)
 {
-    const unsigned half = bitWidth / 2;
+    // Длины сомножителей. Для чётной bitWidth оба равны bitWidth/2. Для нечётной q
+    // берётся на 1 бит длиннее p: при равных длинах произведение имеет максимум
+    // bitWidth-1 бит, поэтому условие (p*q).bit_width() == bitWidth никогда не
+    // выполнялось бы и поиск зацикливался (зависание генератора).
+    const unsigned p_bits = bitWidth / 2;
+    const unsigned q_bits = bitWidth - p_bits;
+
+    // Защита от заведомо невыполнимых запросов: крошечная битность (в т.ч. нулевая,
+    // из-за чего bits-1 переполнялся бы) либо битность, которая вместе с произведением
+    // p*q не помещается в тип T (переполнение делало бы условие bit_width невыполнимым),
+    // привели бы к вечному поиску — сразу возвращаем 0.
+    if (bitWidth < 4 || p_bits == 0 || bitWidth > sizeof(T) * 8)
+        return T(0);
+
     static thread_local std::mt19937_64 rng(std::random_device{}());
     if (seed != 0) // Детерминированный режим (тесты/стенд): воспроизводимое число
         rng.seed(seed);
@@ -1002,13 +1016,13 @@ T generate_semiprime(unsigned bitWidth,
         return false;
     };
 
-    // Поиск простого длиной ровно `half` бит
-    auto find_prime = [&](T &out) {
+    // Поиск простого длиной ровно `bits` бит
+    auto find_prime = [&](T &out, unsigned bits) {
         for (;;) {
             if (::u128::Globals::LoadStop())
                 return false;
 
-            out = random_odd(half);
+            out = random_odd(bits);
             if (cheap_composite_check(out) || !is_prime_generic(out, 3))
                 continue;
 
@@ -1017,27 +1031,41 @@ T generate_semiprime(unsigned bitWidth,
     };
 
     uint64_t candidates = 0;
+    // Если у слишком маленькой p нет ни одного q с произведением нужной длины,
+    // перебор завис бы на этой p навсегда — поэтому после такого числа неудачных
+    // попыток p перерисовывается (гарантия выхода и отсутствие «зависших» хвостов).
+    constexpr uint64_t kMaxTrialsPerP = 256;
     for (;;) {
         T p, q;
-        if (!find_prime(p))
+        if (!find_prime(p, p_bits))
             return T(0);
 
         // Ищем второе простое: q != p и p*q имеет ровно bitWidth бит
-        for (;;) {
+        bool found = false;
+        for (uint64_t trial = 0; trial < kMaxTrialsPerP; ++trial) {
             if (::u128::Globals::LoadStop())
                 return T(0);
 
-            q = random_odd(half);
+            T cand;
+            if (!find_prime(cand, q_bits))
+                return T(0);
+
             ++candidates;
             if (progress && (candidates % 512) == 0)
                 progress(candidates);
 
-            if (q == p || cheap_composite_check(q) || !is_prime_generic(q, 3))
+            if (cand == p)
                 continue;
 
-            if ((p * q).bit_width() == bitWidth)
-                break; // оба простых, произведение — точно bitWidth бит
+            if ((p * cand).bit_width() != bitWidth)
+                continue; // p слишком мала для этой длины q — берём новую пару
+
+            q = cand;
+            found = true;
+            break;
         }
+        if (!found)
+            continue;
 
         // Финальная проверка с высокой надёжностью (k=25, ложноположительное ~1e-15)
         if (!is_prime_generic(p, 25) || !is_prime_generic(q, 25))
