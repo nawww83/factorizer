@@ -50,9 +50,11 @@ ApplicationWindow {
         bitSpin.value = Math.min(Math.max(inputBitLength, bitSpin.from), bitSpin.to);
     }
 
-    width: 520
+    // 700: при 520 ряды кнопок и переключателей (включая «GNFS сначала»)
+    // не помещались и обрезались справа.
+    width: 700
     height: 840
-    minimumWidth: 420
+    minimumWidth: 560
     minimumHeight: 680
     visible: true
     title: "Параллельный факторизатор целых чисел"
@@ -359,6 +361,27 @@ ApplicationWindow {
 
                 ToolTip.visible: hovered
                 ToolTip.text: "Для полупростых чисел (p×q): ECM пропускается,\nсразу работает решето (SIQS/GNFS).\nМетоды Полларда продолжают работать."
+            }
+
+            // Ручной выбор GNFS вместо автоматического SIQS
+            Switch {
+                id: gnfsPreferredSwitch
+
+                text: "GNFS сначала"
+                checked: backend.gnfsPreferred
+                enabled: !backend.isRunning
+                onToggled: backend.gnfsPreferred = checked
+
+                contentItem: Text {
+                    text: gnfsPreferredSwitch.text
+                    font: gnfsPreferredSwitch.font
+                    color: gnfsPreferredSwitch.enabled ? colTextPrimary : colTextSecondary
+                    verticalAlignment: Text.AlignVCenter
+                    leftPadding: gnfsPreferredSwitch.indicator.width + gnfsPreferredSwitch.spacing
+                }
+
+                ToolTip.visible: hovered
+                ToolTip.text: "Запускать GNFS до SIQS для чисел 128-150 бит.\nЭкспериментально: на 136-битном числе SIQS нашёл делитель\nза 0.2 с, а GNFS не справился и за 925 с (сбой извлечения\nкорня: 0 из 13 векторов ядра дали делитель), поэтому\nавтоматический конвейер его не выбирает.\nВне полосы 128-150 бит GNFS всё равно не запускается."
             }
 
             Item {
