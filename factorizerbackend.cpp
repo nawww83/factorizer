@@ -64,8 +64,21 @@ FactorResult<T> build_factor_result(const std::vector<T>& raw_factors, const T& 
             }
         }
     } else {
-        res.completed = true;
-        res.remainder = std::nullopt;
+        // Конвейер возвращает исходное число без разложения и в том случае,
+        // когда все методы исчерпаны (например, полупростое 512 бит: SIQS
+        // ограничен 320 битами, GNFS этой реализации — 150). Раньше такой
+        // результат помечался completed и выглядел в UI как «простой множитель».
+        // Теперь: если число составное — это честный остаток с пометкой,
+        // а если простое — разложение тривиально и всё корректно.
+        const bool single = res.factors.size() == 1 && res.factors.count(original_val) == 1;
+        if (single && !::bignum::generic_ecm::is_prime_generic(original_val, 25)) {
+            res.completed = false;
+            res.factors.clear();
+            res.remainder = original_val;
+        } else {
+            res.completed = true;
+            res.remainder = std::nullopt;
+        }
     }
 
     return res;
@@ -335,7 +348,19 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             if (m_userStopped.load()) {
                 ss << "\n\n(Факторизация остановлена пользователем)\n";
             } else if (!factor_res.completed) {
-                ss << "\n\n(Факторизация не завершена: методы исчерпаны)\n";
+                ss << "\n\n(Факторизация не завершена: методы исчерпаны";
+                // Для чисел крупнее практического предела SIQS объясняем причину:
+                // в программе нет метода такой мощности, нужен, например, CADO-NFS.
+                T unfactored(0);
+                if (factor_res.remainder.has_value())
+                    unfactored = *factor_res.remainder;
+                else if (!factor_res.factors.empty())
+                    unfactored = factor_res.factors.begin()->first;
+                if (unfactored.bit_width() > ::bignum::generic_ecm::kSiqsMaxBits)
+                    ss << ": число крупнее " << ::bignum::generic_ecm::kSiqsMaxBits
+                       << " бит — для таких размеров в программе нет достаточно "
+                          "мощного метода (нужен, например, CADO-NFS)";
+                ss << ")\n";
             }
 
             ss << "\nОбщее время: " << (elapsedMs / 1000.0) << " сек.\n";
