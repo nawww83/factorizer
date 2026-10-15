@@ -59,11 +59,18 @@ struct GnfsParams
     uint64_t lp_mult = 250;  // граница large prime = p_max * lp_mult
 };
 
-// Подбор параметров по разрядности. Тиры параметров заданы до ~400 бит
-// (чтобы кроссовер SIQS/GNFS ≈ 320 бит попадал в формально рабочую зону).
-// Реальный рабочий диапазон этой реализации (линейное решето, base-m полином,
-// плотный Гаусс) — до ~150 бит; всё крупнее отсекает оценка достижимости
-// в solve() — с честным сообщением вместо пустого прогона.
+// Подбор параметров по разрядности. Реальный рабочий диапазон этой реализации
+// (линейное решето, base-m полином, плотный Гаусс) — до ~150 бит включительно.
+// Замеры на полупростых p×q (строк ожидается / нужно в оценке достижимости):
+//   135 бит — 6.2e4 / 15285 (проходит),  150 бит — 2.1e4 / 15285 (проходит),
+//   152 бит — 5.7e3 / 12205 (отказ),    200 бит — 496 / 22362,
+//   320 бит — 0.46 / 41658. Дефицит растёт экспоненциально, и закрыть его
+// подстройкой тиров нельзя: нужны факторные базы 2^25..2^30, решетчатое решето
+// (special-q) и разреженная матрица с блочным Wiedemann, т.е. другая
+// реализация. Ресурсы (ядра/память) тут не помогают — не хватает выхода на пару.
+// Поэтому выше 150 бит возвращаем nullopt: раньше тиры до 400 бит лишь
+// удлиняли отказ — построение факторных баз с поиском корней стоило 10-54 с,
+// после чего решето всё равно не запускалось.
 inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits)
 {
     GnfsParams p;
@@ -74,39 +81,28 @@ inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits)
         // запас по b (300000) покрывает «невезучие» числа.
         p.d = 4;  p.rfb_size = 6000;  p.afb_size = 9000;  p.qcb_size = 48;
         p.sieve_A = 65536; p.max_b = 300000; p.lp_mult = 400;
-    } else if (bits <= 180) {
-        // Нормы ~2^(bits/4): базы крупнее, полезная область b шире.
-        p.d = 4;  p.rfb_size = 5000;  p.afb_size = 7000;  p.qcb_size = 16;
-        p.sieve_A = 32768; p.max_b = 200000; p.lp_mult = 300;
-    } else if (bits <= 210) {
-        // d=5 уменьшает m до 2^(bits/5); регион сужается, чтобы алгебраические
-        // нормы не разрастались как b^5.
-        p.d = 5;  p.rfb_size = 9000;  p.afb_size = 13000; p.qcb_size = 16;
-        p.sieve_A = 8192;  p.max_b = 200000; p.lp_mult = 400;
-    } else if (bits <= 240) {
-        p.d = 5;  p.rfb_size = 12000; p.afb_size = 17000; p.qcb_size = 16;
-        p.sieve_A = 4096;  p.max_b = 250000; p.lp_mult = 400;
-    } else if (bits <= 280) {
-        // Базы упираются в стоимость Гаусса (~36k столбцов).
-        p.d = 5;  p.rfb_size = 15000; p.afb_size = 21000; p.qcb_size = 16;
-        p.sieve_A = 2048;  p.max_b = 300000; p.lp_mult = 500;
-    } else if (bits <= 320) {
-        // Кроссовер SIQS/GNFS: GNFS получает числа отсюда и выше. Тиры выше
-        // 280 бит формально согласованы (полином, базы и извлечение корня
-        // универсальны по d), но нормы вырастают и оценка достижимости в
-        // solve() почти всегда честно отказывает — без пустого прогона.
-        p.d = 5;  p.rfb_size = 17000; p.afb_size = 24000; p.qcb_size = 16;
-        p.sieve_A = 1024;  p.max_b = 300000; p.lp_mult = 500;
-    } else if (bits <= 360) {
-        p.d = 6;  p.rfb_size = 19000; p.afb_size = 27000; p.qcb_size = 16;
-        p.sieve_A = 512;  p.max_b = 300000; p.lp_mult = 500;
-    } else if (bits <= 400) {
-        p.d = 6;  p.rfb_size = 21000; p.afb_size = 30000; p.qcb_size = 16;
-        p.sieve_A = 256;  p.max_b = 300000; p.lp_mult = 500;
     } else {
         return std::nullopt;
     }
     return p;
+}
+
+// Верхнее простое факторной базы по её размеру (p_k-е по счёту простое).
+// Нужно только для предварительной оценки достижимости ДО построения баз:
+// решето Эратосфена до оценки p_k стоит миллисекунды, тогда как построение AFB
+// с поиском корней по каждому простому — десятки секунд.
+inline uint64_t estimate_base_max_prime(size_t entries)
+{
+    if (entries == 0)
+        return 2;
+    const double n = static_cast<double>(entries);
+    // Верхняя оценка Россора—Шонфельда: p_n < n * (ln n + ln ln n) для n >= 6.
+    double bound = (n >= 6.0) ? n * (std::log(n) + std::log(std::log(n))) : 16.0;
+    if (bound < 16.0)
+        bound = 16.0;
+    auto ps = ::u128::utils::primes(static_cast<unsigned>(bound) + 1);
+    const size_t idx = std::min(entries, ps.size());
+    return ps[idx - 1];
 }
 
 // log10 rho(u) для функции Дикмана по таблице с линейной интерполяцией.
@@ -478,17 +474,17 @@ public:
     {
         uint32_t bits = m_N.bit_width();
 
-        // Масштабируемые параметры под разрядность. Числа за пределами
-        // реализации (> ~280 бит) получают честный отказ сразу, без прогона.
+        // Масштабируемые параметры под разрядность. Числа крупнее рабочей
+        // полосы (~150 бит) получают честный отказ мгновенно: в конвейере
+        // факторизации GNFS выше 150 бит и не вызывается, поэтому пауза перед
+        // отказом здесь не нужна.
         auto params_opt = select_gnfs_params(bits);
         if (!params_opt.has_value()) {
             if (status_cb) {
                 status_cb("GNFS: " + std::to_string(bits)
                           + "-битное число вне пределов этой реализации GNFS "
-                            "(тиры параметров заданы до ~400 бит, реальный "
-                            "рабочий диапазон до ~150). Для таких размеров "
-                            "нужен, например, CADO-NFS на кластере.");
-                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+                            "(рабочий диапазон до ~150 бит; для больших чисел "
+                            "нужен, например, CADO-NFS на кластере).");
             }
             return std::nullopt;
         }
@@ -520,6 +516,25 @@ public:
                       + std::to_string(m_rat_thresh) + "/" + std::to_string(m_alg_thresh)
                       + ", область |a|<=" + std::to_string(m_sieve_A));
 
+        // Предварительная оценка достижимости ДО построения факторных баз:
+        // поиск корней для AFB стоит 5-54 с, а для оценки нужны только полином
+        // и верхние простые баз. RFB — это первые rfb_size простых, так что её
+        // p_max берём точно; AFB состоит из пар (p, r) с ~1.1 корня на простое,
+        // поэтому для afb_size пар хватает ~0.9*afb_size простых (меньший p_max
+        // делает оценку слегка строже — в консервативную сторону).
+        {
+            const size_t est_cols = (1 + params.rfb_size + 1 + params.afb_size)
+                                    + params.qcb_size;
+            const size_t est_needed = est_cols + std::max<size_t>(64, est_cols / 64);
+            const uint64_t est_rfb_max = estimate_base_max_prime(params.rfb_size);
+            const uint64_t est_afb_max = estimate_base_max_prime(params.afb_size * 9 / 10);
+            if (!estimate_feasibility(est_rfb_max, est_afb_max, est_needed,
+                                      "Предварительная оценка (до построения баз)", 0,
+                                      status_cb)) {
+                return std::nullopt;
+            }
+        }
+
         if (status_cb)
             status_cb("GNFS: Построение баз (RFB " + std::to_string(params.rfb_size)
                       + " / AFB " + std::to_string(params.afb_size) + ")...");
@@ -532,9 +547,12 @@ public:
         // нетривиального вектора в ядре.
         m_relations_needed = total_cols + std::max<size_t>(64, total_cols / 64);
 
-        // Порядковая оценка достижимости на типовых нормах: если ожидаемое
-        // число гладких пар катастрофически мало — честный отказ сразу.
-        if (!estimate_feasibility(status_cb)) {
+        // Итоговая оценка достижимости по уже построенным базам (точные p_max).
+        // Если бы предварительная оценка ошиблась — честный отказ здесь.
+        if (!estimate_feasibility(m_RFB.back().p, m_AFB.back().p,
+                                  m_relations_needed,
+                                  "Итоговая оценка по построенным базам", 5000,
+                                  status_cb)) {
             return std::nullopt;
         }
 
@@ -840,10 +858,19 @@ private:
     // rho(u_rat)*rho(u_alg) по узлам сетки и домножаем на ширины интервалов.
     // Если ожидание ниже нужного числа строк — честный отказ сразу, без
     // многочасового пустого прогона.
-    bool estimate_feasibility(std::function<void(const std::string &)> status_cb)
+    // Верхние простые баз и нужное число строк передаются снаружи: это позволяет
+    // запускать оценку ДО построения факторных баз (p_max берутся из оценки по
+    // размеру базы) и экономить 10-54 с поиска корней на заведомо нереалистичных
+    // числах. tag различает предварительную и итоговую оценки, refusal_delay_ms —
+    // пауза перед отказом, чтобы пользователь успел прочитать сообщение (0 в
+    // предварительной оценке: там важна скорость отказа).
+    bool estimate_feasibility(uint64_t p_max_rfb, uint64_t p_max_afb,
+                              size_t relations_needed, const char *tag,
+                              int refusal_delay_ms,
+                              const std::function<void(const std::string &)> &status_cb) const
     {
-        const double log2_pr = std::log2(static_cast<double>(m_RFB.back().p));
-        const double log2_pa = std::log2(static_cast<double>(m_AFB.back().p));
+        const double log2_pr = std::log2(static_cast<double>(p_max_rfb));
+        const double log2_pa = std::log2(static_cast<double>(p_max_afb));
 
         // Лог-сетки: b и |a|. Точки концентрируются у малых значений, где
         // интегранд ненулевой.
@@ -910,29 +937,30 @@ private:
         expected *= 0.5;
 
         if (status_cb) {
-            char buf[256];
+            char buf[320];
             std::snprintf(buf, sizeof(buf),
-                          "GNFS: Оценка по области решета: ожидается ~%.3g строк "
+                          "GNFS: %s: ожидается ~%.3g строк "
                           "(нужно %zu, базы %llu / %llu)",
-                          expected, m_relations_needed,
-                          static_cast<unsigned long long>(m_RFB.back().p),
-                          static_cast<unsigned long long>(m_AFB.back().p));
+                          tag, expected, relations_needed,
+                          static_cast<unsigned long long>(p_max_rfb),
+                          static_cast<unsigned long long>(p_max_afb));
             status_cb(buf);
         }
 
-        if (expected < static_cast<double>(m_relations_needed)) {
+        if (expected < static_cast<double>(relations_needed)) {
             if (status_cb) {
-                char buf[384];
+                char buf[448];
                 std::snprintf(buf, sizeof(buf),
                               "GNFS: Задача оценена как нереалистичная для этой "
                               "реализации (ожидается ~%.3g строк, нужно %zu при "
                               "базах %llu / %llu). Число слишком велико: нужен, "
                               "например, CADO-NFS на кластере.",
-                              expected, m_relations_needed,
-                              static_cast<unsigned long long>(m_RFB.back().p),
-                              static_cast<unsigned long long>(m_AFB.back().p));
+                              expected, relations_needed,
+                              static_cast<unsigned long long>(p_max_rfb),
+                              static_cast<unsigned long long>(p_max_afb));
                 status_cb(buf);
-                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+                if (refusal_delay_ms > 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(refusal_delay_ms));
             }
             return false;
         }

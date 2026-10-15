@@ -719,9 +719,19 @@ std::optional<T> ecm_parallel(const T& n,
 // skip_ecm = true: лестница ECM пропускается (удобно для полупростых чисел p×q —
 // после методов Полларда сразу запускаются решета SIQS/GNFS).
 //
-// Кроссовер SIQS/GNFS ≈ 320 бит: до него быстрее квадратичное решето,
-// начиная с него — общее решето числового поля (GNFS).
-constexpr unsigned kSiqsGnfsCrossoverBits = 320;
+// Реальные рабочие диапазоны тяжёлых методов (замеры на полупростых p×q):
+//  - GNFS этой реализации собирает соотношения примерно до 150 бит включительно;
+//    выше оценка достижимости честно отказывает (200 бит: ожидается 496 строк
+//    против 22362 нужных, 320 бит — 0.46 против 41658). Классический кроссовер
+//    GNFS/SIQS ≈ 320 бит относится к полноценному NFS (решётчатое решётко, базы
+//    2^25..2^30, разреженная матрица), а не к линейному решету отсюда, поэтому
+//    в конвейере GNFS работает только в своей рабочей полосе, а SIQS остаётся
+//    основным методом для 200-320 бит.
+//  - SIQS: 200 бит — ~3 с, 256 бит — ~30 мин, 288 бит — ~3 ч, 320 бит — ~70 ч;
+//    выше 320 бит его тоже не запускаем (сутки и более на число — не результат).
+constexpr unsigned kGnfsMinBits = 128; // ниже SIQS справляется быстрее
+constexpr unsigned kGnfsMaxBits = 150; // предел этой реализации GNFS
+constexpr unsigned kSiqsMaxBits = 320; // дальше SIQS идёт сутками
 
 template <typename T>
 std::vector<T> factor_parallel_generic(T n,
@@ -890,26 +900,12 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7. SIQS для чисел меньше кроссовера (~320 бит): на этих размерах он быстрее GNFS.
-    if (n.bit_width() < kSiqsGnfsCrossoverBits) {
-        if (status_cb)
-            status_cb("Запуск SIQS (факторизация через решето)...");
-        if (profiler)
-            profiler->start_stage("SIQS (Квадратичное решето)");
-        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
-        if (siqs_res.has_value()) {
-            T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
-            factors.insert(factors.end(), sub1.begin(), sub1.end());
-            factors.insert(factors.end(), sub2.begin(), sub2.end());
-            return factors;
-        }
-    }
-
-    // 8. GNFS для чисел >= кроссовера (~320 бит): быстрее SIQS, поэтому запускается
-    // вместо него (при skip_ecm — сразу после методов Полларда, без ECM).
-    if (n.bit_width() >= kSiqsGnfsCrossoverBits) {
+    // 7. GNFS — только в реальной рабочей полосе этой реализации (128-150 бит).
+    //    Числа крупнее оценка достижимости в gnfs.hpp отвергает, а построение
+    //    факторных баз стоило бы 5-54 с впустую, поэтому их сразу отправляем
+    //    в SIQS. При отказе GNFS (пограничные 145-150 бит) — тоже фолбэк на SIQS.
+    if (n.bit_width() >= kGnfsMinBits && n.bit_width() <= kGnfsMaxBits
+        && !::u128::Globals::LoadStop()) {
         if (status_cb)
             status_cb("Запуск GNFS (Общее решето числового поля)...");
         if (profiler)
@@ -918,6 +914,26 @@ std::vector<T> factor_parallel_generic(T n,
         auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb);
         if (gnfs_res.has_value()) {
             T f = *gnfs_res;
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+            factors.insert(factors.end(), sub1.begin(), sub1.end());
+            factors.insert(factors.end(), sub2.begin(), sub2.end());
+            return factors;
+        }
+    }
+
+    // 8. SIQS — основной метод для 200-320 бит и фолбэк после отказа GNFS.
+    //    (Раньше он был закрыт воротами "< 320 бит" и на 320-битных числах
+    //    не запускался вовсе: конвейер пытался в GNFS, тратил 40-60 с на его
+    //    настройку, получал отказ и возвращал число без разложения.)
+    if (n.bit_width() <= kSiqsMaxBits && !::u128::Globals::LoadStop()) {
+        if (status_cb)
+            status_cb("Запуск SIQS (факторизация через решето)...");
+        if (profiler)
+            profiler->start_stage("SIQS (Квадратичное решето)");
+        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
+        if (siqs_res.has_value()) {
+            T f = *siqs_res;
             auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
             auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
             factors.insert(factors.end(), sub1.begin(), sub1.end());
