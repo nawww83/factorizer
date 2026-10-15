@@ -176,7 +176,10 @@ ApplicationWindow {
             ComboBox {
                 id: bitCombo
 
-                model: [128, 256, 512, 1024, 2048, 4096]
+                // Больше 512 бит в программе нет работающего метода
+                // (SIQS ограничен 320 битами, GNFS этой реализации — 150),
+                // поэтому крупные размеры в интерфейс не выводим.
+                model: [128, 256, 512]
                 currentIndex: 0
                 implicitWidth: 90
                 enabled: !backend.isRunning && !autoBitCheckBox.checked
@@ -396,7 +399,7 @@ ApplicationWindow {
                 implicitHeight: 36
                 text: backend.isRunning ? "⏹ Остановить" : "▶ Факторизовать"
                 highlighted: !backend.isRunning
-                enabled: backend.isRunning || (sanitizeNumber(inputField.text).length > 0 && window.inputBitLength <= 4096)
+                enabled: backend.isRunning || (sanitizeNumber(inputField.text).length > 0 && window.inputBitLength <= bitCombo.model[bitCombo.model.length - 1])
                 onClicked: {
                     if (backend.isRunning)
                         backend.stop();
