@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -40,6 +42,97 @@ struct QuadraticCharacter
     uint32_t q;
     uint32_t s; // Корень f(s) == 0 (mod q), f'(s) != 0 (mod q)
 };
+
+// Параметры решета, масштабируемые по разрядности числа.
+// Раньше все значения были зафиксированы под 128-битные числа, из-за чего
+// GNFS для чисел > ~180 бит не находил НИ ОДНОГО соотношения: типовые нормы
+// вырастали до 2^140...2^180, а гладкость по базе из простых < 5000 для них
+// имеет вероятность ~1e-13 на сторону (подробности в комментарии у таблицы).
+struct GnfsParams
+{
+    uint32_t d = 4;          // степень алгебраического полинома
+    size_t rfb_size = 3000;  // размер рациональной факторной базы
+    size_t afb_size = 5000;  // размер алгебраической факторной базы
+    size_t qcb_size = 16;    // число квадратичных характеров
+    int sieve_A = 65536;     // |a| <= sieve_A
+    uint32_t max_b = 60000;  // предел по b (ранее жёсткий MAX_B)
+    uint64_t lp_mult = 250;  // граница large prime = p_max * lp_mult
+};
+
+// Подбор параметров по разрядности. Тиры параметров заданы до ~400 бит
+// (чтобы кроссовер SIQS/GNFS ≈ 320 бит попадал в формально рабочую зону).
+// Реальный рабочий диапазон этой реализации (линейное решето, base-m полином,
+// плотный Гаусс) — до ~150 бит; всё крупнее отсекает оценка достижимости
+// в solve() — с честным сообщением вместо пустого прогона.
+inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits)
+{
+    GnfsParams p;
+    if (bits <= 150) {
+        // Проверено практикой (128-битные полупростые). Базы 6000/9000 вместо
+        // 3000/5000: больший предел гладкости заметно повышает выход на
+        // 135-150 битах (u нормы падает ~ на 0.3-0.5, rho — в 2-3 раза),
+        // запас по b (300000) покрывает «невезучие» числа.
+        p.d = 4;  p.rfb_size = 6000;  p.afb_size = 9000;  p.qcb_size = 48;
+        p.sieve_A = 65536; p.max_b = 300000; p.lp_mult = 400;
+    } else if (bits <= 180) {
+        // Нормы ~2^(bits/4): базы крупнее, полезная область b шире.
+        p.d = 4;  p.rfb_size = 5000;  p.afb_size = 7000;  p.qcb_size = 16;
+        p.sieve_A = 32768; p.max_b = 200000; p.lp_mult = 300;
+    } else if (bits <= 210) {
+        // d=5 уменьшает m до 2^(bits/5); регион сужается, чтобы алгебраические
+        // нормы не разрастались как b^5.
+        p.d = 5;  p.rfb_size = 9000;  p.afb_size = 13000; p.qcb_size = 16;
+        p.sieve_A = 8192;  p.max_b = 200000; p.lp_mult = 400;
+    } else if (bits <= 240) {
+        p.d = 5;  p.rfb_size = 12000; p.afb_size = 17000; p.qcb_size = 16;
+        p.sieve_A = 4096;  p.max_b = 250000; p.lp_mult = 400;
+    } else if (bits <= 280) {
+        // Базы упираются в стоимость Гаусса (~36k столбцов).
+        p.d = 5;  p.rfb_size = 15000; p.afb_size = 21000; p.qcb_size = 16;
+        p.sieve_A = 2048;  p.max_b = 300000; p.lp_mult = 500;
+    } else if (bits <= 320) {
+        // Кроссовер SIQS/GNFS: GNFS получает числа отсюда и выше. Тиры выше
+        // 280 бит формально согласованы (полином, базы и извлечение корня
+        // универсальны по d), но нормы вырастают и оценка достижимости в
+        // solve() почти всегда честно отказывает — без пустого прогона.
+        p.d = 5;  p.rfb_size = 17000; p.afb_size = 24000; p.qcb_size = 16;
+        p.sieve_A = 1024;  p.max_b = 300000; p.lp_mult = 500;
+    } else if (bits <= 360) {
+        p.d = 6;  p.rfb_size = 19000; p.afb_size = 27000; p.qcb_size = 16;
+        p.sieve_A = 512;  p.max_b = 300000; p.lp_mult = 500;
+    } else if (bits <= 400) {
+        p.d = 6;  p.rfb_size = 21000; p.afb_size = 30000; p.qcb_size = 16;
+        p.sieve_A = 256;  p.max_b = 300000; p.lp_mult = 500;
+    } else {
+        return std::nullopt;
+    }
+    return p;
+}
+
+// log10 rho(u) для функции Дикмана по таблице с линейной интерполяцией.
+// Точности хватает для порядковой оценки «задача достижима / нет».
+inline double log10_dickman(double u)
+{
+    static const double table[][2] = {
+        {1.0, 0.0},    {2.0, -0.513},  {3.0, -1.313},  {4.0, -2.309},
+        {5.0, -3.459}, {6.0, -4.708},  {7.0, -6.022},  {8.0, -7.391},
+        {9.0, -8.806}, {10.0, -10.27}, {12.0, -13.35}, {15.0, -18.10},
+        {20.0, -26.47}, {25.0, -35.43}, {30.0, -44.73}, {40.0, -64.3},
+        {50.0, -84.7},
+    };
+    if (u <= 1.0)
+        return 0.0;
+    const size_t n = sizeof(table) / sizeof(table[0]);
+    if (u >= table[n - 1][0])
+        return -u * std::log10(u);
+    for (size_t i = 1; i < n; ++i) {
+        if (u <= table[i][0]) {
+            double t = (u - table[i - 1][0]) / (table[i][0] - table[i - 1][0]);
+            return table[i - 1][1] + t * (table[i][1] - table[i - 1][1]);
+        }
+    }
+    return 0.0;
+}
 
 template<typename T>
 struct GNFSRelation
@@ -239,14 +332,97 @@ inline std::vector<uint32_t> poly_pow_mod_q(std::vector<uint32_t> base,
     return res;
 }
 
+// --- Быстрая проверка неприводимости по модулю q ---
+// Полный перебор квадратных делителей стоит O(q^2) (для q ~ 65000 — миллиарды
+// операций), поэтому для подбора КРУПНОГО q (больше бит на цифру базы => короче
+// K => подъём Ньютона O(K^2) заметно дешевле) используем критерий Фробениуса:
+// f степени d неприводимо над F_q <=> x^(q^d) == x (mod f) и
+// gcd(f, x^(q^(d/ℓ)) - x) == 1 для всех простых делителей ℓ степени d.
+inline void poly_trim_mod_q(std::vector<uint32_t> &v)
+{
+    while (!v.empty() && v.back() == 0)
+        v.pop_back();
+}
+
+// НОД двух полиномов по модулю простого q (евклид; степени tiny, O(d^2))
+inline std::vector<uint32_t> poly_gcd_mod_q(std::vector<uint32_t> a,
+                                            std::vector<uint32_t> b,
+                                            uint32_t q)
+{
+    poly_trim_mod_q(a);
+    poly_trim_mod_q(b);
+    while (!b.empty()) {
+        const uint32_t inv_lead = ::bignum::siqs::mod_inv32(b.back(), q);
+        std::vector<uint32_t> r = a;
+        while (!r.empty() && r.size() >= b.size()) {
+            const size_t shift = r.size() - b.size();
+            const uint32_t coef = static_cast<uint32_t>(1ULL * r.back() * inv_lead % q);
+            if (coef != 0) {
+                for (size_t i = 0; i < b.size(); ++i) {
+                    const uint64_t sub = 1ULL * b[i] * coef % q;
+                    r[shift + i] = static_cast<uint32_t>((r[shift + i] + q - sub) % q);
+                }
+            }
+            poly_trim_mod_q(r);
+        }
+        a = std::move(b);
+        b = std::move(r);
+    }
+    return a;
+}
+
+inline bool is_irreducible_mod_q_fast(const std::vector<uint32_t> &f_mod, uint32_t q)
+{
+    const size_t d = f_mod.size() - 1;
+    if (d < 2)
+        return false;
+
+    // Какие k = d/ℓ нужны для проверок НОД (ℓ — простой делитель d)
+    std::vector<size_t> need_k;
+    for (size_t pp = 2; pp <= d; ++pp) {
+        if (d % pp == 0) {
+            bool is_prime = true;
+            for (size_t t = 2; t * t <= pp; ++t) {
+                if (pp % t == 0) {
+                    is_prime = false;
+                    break;
+                }
+            }
+            if (is_prime)
+                need_k.push_back(d / pp);
+        }
+    }
+
+    std::vector<uint32_t> g(d, 0);
+    if (d >= 2)
+        g[1] = 1; // x mod (f, q)
+    for (size_t k = 1; k <= d; ++k) {
+        g = poly_pow_mod_q(g, q, f_mod, q); // g <- g^q: g = x^(q^k) mod (f, q)
+        if (k == d) {
+            for (size_t i = 0; i < d; ++i) {
+                const uint32_t want = (i == 1) ? 1u : 0u;
+                if (g[i] != want)
+                    return false; // x^(q^d) != x
+            }
+        } else if (std::find(need_k.begin(), need_k.end(), k) != need_k.end()) {
+            std::vector<uint32_t> diff = g;
+            diff[1] = (diff[1] + q - 1) % q; // g - x
+            auto gd = poly_gcd_mod_q(f_mod, diff, q);
+            poly_trim_mod_q(gd);
+            const bool is_one = gd.empty() || (gd.size() == 1 && gd[0] != 0);
+            if (!is_one)
+                return false; // есть делитель степени 1..ℓ
+        }
+    }
+    return true;
+}
+
 //
 // --- Основной класс Решета Числового Поля (GNFS) ---
 
 template<typename T>
 class GNFSSolver
 {
-    friend struct GNFSProbe; // Доступ для диагностического пробника/тестов
-
     T m_N;
     uint32_t m_d = 3;
     T m_m;
@@ -261,6 +437,23 @@ class GNFSSolver
     uint64_t m_L_rat_max = 0;
     uint64_t m_L_alg_max = 0;
 
+    // Масштабируемые параметры (см. GnfsParams)
+    uint32_t m_max_b = 60000;
+    uint64_t m_lp_mult = 250;
+    uint8_t m_rat_thresh = 28;
+    uint8_t m_alg_thresh = 34;
+    std::chrono::steady_clock::time_point m_sieve_start{};
+    // Последний вывод статуса (под m_rel_mutex) — троттлинг.
+    std::chrono::steady_clock::time_point m_last_status{};
+
+    // Диагностика решета (для отчёта после прогона)
+    std::atomic<uint64_t> m_stat_hits{0};        // пар прошли пороги
+    std::atomic<uint64_t> m_stat_pre_rat_fail{0}; // отсеял предфильтр (рац. сторона)
+    std::atomic<uint64_t> m_stat_pre_alg_fail{0}; // отсеял предфильтр (алг. сторона)
+    std::atomic<uint64_t> m_stat_rat_fail{0};     // не разложилась по RFB
+    std::atomic<uint64_t> m_stat_afb_fail{0};     // не разложилась по AFB
+    std::atomic<uint64_t> m_stat_success{0};      // принято соотношений
+
     std::mutex m_rel_mutex;
     std::vector<GNFSRelation<T>> m_relations;
     std::unordered_set<uint64_t> m_seen_ab;
@@ -268,6 +461,9 @@ class GNFSSolver
     // Таблицы для спаривания одиночных больших простых:
     std::unordered_map<uint64_t, GNFSRelation<T>> m_rat_partials;
     std::unordered_map<uint64_t, GNFSRelation<T>> m_alg_partials;
+    // Спаривание соотношений с большими простыми С ОБЕИХ сторон:
+    // ключ — (ratLP, algLP<<32 | корень). Обе пары взаимно уничтожаются.
+    std::map<std::pair<uint64_t, uint64_t>, GNFSRelation<T>> m_dblp_partials;
 
     size_t m_full_relations_count = 0;
     size_t m_combined_count = 0;
@@ -282,33 +478,52 @@ public:
     {
         uint32_t bits = m_N.bit_width();
 
-        // Для 128-180 бит степень d=4 дает минимальные нормы и взрывную плотность:
-        if (bits < 180)
-            m_d = 4;
-        else if (bits < 280)
-            m_d = 5;
-        else
-            m_d = 5;
+        // Масштабируемые параметры под разрядность. Числа за пределами
+        // реализации (> ~280 бит) получают честный отказ сразу, без прогона.
+        auto params_opt = select_gnfs_params(bits);
+        if (!params_opt.has_value()) {
+            if (status_cb) {
+                status_cb("GNFS: " + std::to_string(bits)
+                          + "-битное число вне пределов этой реализации GNFS "
+                            "(тиры параметров заданы до ~400 бит, реальный "
+                            "рабочий диапазон до ~150). Для таких размеров "
+                            "нужен, например, CADO-NFS на кластере.");
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            }
+            return std::nullopt;
+        }
+        const GnfsParams &params = *params_opt;
+        m_d = params.d;
+        m_sieve_A = params.sieve_A;
+        m_max_b = params.max_b;
+        m_lp_mult = params.lp_mult;
 
         if (status_cb)
-            status_cb("GNFS: Подбор Base-m полинома (d=" + std::to_string(m_d) + ")...");
-        if (!select_polynomial()) {
+            status_cb("GNFS: " + std::to_string(bits) + " бит: подбор Base-m полинома (d="
+                      + std::to_string(m_d) + ")...");
+        if (!select_polynomial(params)) {
             return std::nullopt;
         }
 
-        // Подбор баз эмпирический (см. замеры для 128-бит): слишком маленькие базы
-        // (800/850) дают вероятность гладкости алгебраической нормы ~0.1%,
-        // и решето физически не успевает набрать строки под СЛАУ.
-        // 3000/5000: ~1.4x запаса строк к b ~ 1600-2600.
-        size_t rfb_target = 3000;
-        size_t afb_target = 5000;
-        // Полезная область малых |a| (< 65536) и малых b: алгебраическая норма
-        // растёт как b^4, дальше решето даёт лишь мусор.
-        m_sieve_A = 65536;
+        // Пороги решета выводятся из реального m: полезная зона малых b даёт
+        // нормы примерно от m (см. |b*m - a| >= m - A). Для проверенной точки
+        // (128 бит, m=2^32) формула воспроизводит зафиксированные 28/34.
+        {
+            uint32_t m_bits = m_m.bit_width();
+            m_rat_thresh = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(m_bits) - 4, 16, 250));
+            m_alg_thresh = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(m_bits) + 2, 16, 250));
+        }
 
         if (status_cb)
-            status_cb("GNFS: Построение рациональной и алгебраической баз...");
-        if (!build_factor_bases(rfb_target, afb_target, 16)) {
+            status_cb("GNFS: Полином d=" + std::to_string(m_d) + ", m=" + m_m.toString()
+                      + " (" + std::to_string(m_m.bit_width()) + " бит), пороги "
+                      + std::to_string(m_rat_thresh) + "/" + std::to_string(m_alg_thresh)
+                      + ", область |a|<=" + std::to_string(m_sieve_A));
+
+        if (status_cb)
+            status_cb("GNFS: Построение баз (RFB " + std::to_string(params.rfb_size)
+                      + " / AFB " + std::to_string(params.afb_size) + ")...");
+        if (!build_factor_bases(params.rfb_size, params.afb_size, params.qcb_size)) {
             return std::nullopt;
         }
 
@@ -317,16 +532,31 @@ public:
         // нетривиального вектора в ядре.
         m_relations_needed = total_cols + std::max<size_t>(64, total_cols / 64);
 
+        // Порядковая оценка достижимости на типовых нормах: если ожидаемое
+        // число гладких пар катастрофически мало — честный отказ сразу.
+        if (!estimate_feasibility(status_cb)) {
+            return std::nullopt;
+        }
+
         m_relations.clear();
         m_seen_ab.clear();
         m_rat_partials.clear();
         m_alg_partials.clear();
+        m_dblp_partials.clear();
         m_full_relations_count = 0;
         m_combined_count = 0;
+        m_stat_hits.store(0);
+        m_stat_pre_rat_fail.store(0);
+        m_stat_pre_alg_fail.store(0);
+        m_stat_rat_fail.store(0);
+        m_stat_afb_fail.store(0);
+        m_stat_success.store(0);
         m_done.store(false);
+        m_sieve_start = std::chrono::steady_clock::now();
 
         if (status_cb)
-            status_cb("GNFS: Запуск двухстороннего решета (RFB + AFB + Large Primes)...");
+            status_cb("GNFS: Запуск решета (RFB + AFB + Large Primes), b до "
+                      + std::to_string(m_max_b) + "...");
         unsigned num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0)
             num_threads = 4;
@@ -347,6 +577,22 @@ public:
 
         if (::u128::Globals::LoadStop()) {
             return std::nullopt;
+        }
+
+        // Диагностика решета: сколько пар прошло пороги, сколько отсеял
+        // предфильтр по логам и сколько не разложилось по базам.
+        if (status_cb) {
+            char buf[384];
+            std::snprintf(buf, sizeof(buf),
+                          "GNFS: Решето: пар прошло пороги %llu, предфильтр отсеял %llu "
+                          "(рац.) / %llu (алг.), не разложилось %llu / %llu, принято %llu",
+                          static_cast<unsigned long long>(m_stat_hits.load()),
+                          static_cast<unsigned long long>(m_stat_pre_rat_fail.load()),
+                          static_cast<unsigned long long>(m_stat_pre_alg_fail.load()),
+                          static_cast<unsigned long long>(m_stat_rat_fail.load()),
+                          static_cast<unsigned long long>(m_stat_afb_fail.load()),
+                          static_cast<unsigned long long>(m_stat_success.load()));
+            status_cb(buf);
         }
 
         // 1. Проверка на пустоту или недостаток соотношений перед матрицей
@@ -377,42 +623,86 @@ public:
     }
 
 private:
-    bool select_polynomial()
+    // Оценка качества base-m полинома: максимум битовой длины коэффициентов
+    // (доминирующий размер норм).
+    uint32_t poly_score(const std::vector<T> &coeffs) const
     {
-        // Подбираем m так, чтобы m^d <= N < 2 * m^d, тогда старший коэффициент c_d РОВНО равен 1!
-        m_m = nth_root(m_N, m_d);
-        if (m_m <= T(2))
-            return false;
+        uint32_t max_bits = 0;
+        for (const auto &c : coeffs) {
+            uint32_t b = c.bit_width();
+            if (b > max_bits)
+                max_bits = b;
+        }
+        return max_bits;
+    }
 
-        while (true) {
-            T m_pow_d = T(1);
-            for (uint32_t i = 0; i < m_d; ++i)
-                m_pow_d = m_pow_d * m_m;
+    // Подбор Base-m полинома: перебираем m в допустимом диапазоне
+    // [N^(1/d), 2^(1/d) * N^(1/d)) (тогда старший коэффициент равен 1)
+    // и выбираем кандидата с наименьшей нормой коэффициентов. Степень берётся
+    // только из таблицы параметров: попытка d+1 для малых чисел проигрывала —
+    // коэффициенты мельче, но нормы F(a,b) ~ m*(|a|+b)^d растут со степенью.
+    bool select_polynomial(const GnfsParams &params)
+    {
+        bool found = false;
+        uint32_t best_score = UINT32_MAX;
+        const uint32_t d_try = params.d;
 
-            auto [top_q, top_r] = ::bignum::siqs::div_rem(m_N, m_pow_d);
-            if (top_q == T(1))
-                break; // Идеально: c_d == 1 и все остальные c_i < m!
-            if (top_q == T(0)) {
-                m_m = m_m - T(1);
-            } else {
-                // Увеличиваем m, пока c_d не станет равным 1
-                T step = m_m >> 4;
+        {
+            T m0 = nth_root(m_N, d_try);
+            if (m0 <= T(2))
+                return false;
+
+            // Верхняя граница диапазона: (m+1)^d > N, т.е. m < 2^(1/d) * m0.
+            // Оцениваем множителем 1 + 1/d (немного больше нужного — лишние
+            // кандидаты отбрасывает проверка старшего коэффициента).
+            constexpr int NUM_CANDIDATES = 48;
+            for (int k = 0; k < NUM_CANDIDATES; ++k) {
+                // m = m0 + k * step, step ~ m0 / NUM_CANDIDATES / d
+                T step = m0 / T(static_cast<uint64_t>(NUM_CANDIDATES * d_try));
                 if (step == T(0))
                     step = T(1);
-                m_m = m_m + step;
+                T cand = m0 + step * T(static_cast<uint64_t>(k));
+                if (cand <= T(2))
+                    continue;
+
+                T m_pow_d = T(1);
+                bool overflow = false;
+                for (uint32_t i = 0; i < d_try; ++i) {
+                    if (m_pow_d > ::bignum::siqs::div_q(~T(0), cand)) {
+                        overflow = true;
+                        break;
+                    }
+                    m_pow_d = m_pow_d * cand;
+                }
+                if (overflow || m_pow_d > m_N)
+                    continue;
+
+                auto [top_q, top_r] = ::bignum::siqs::div_rem(m_N, m_pow_d);
+                (void)top_r;
+                if (top_q != T(1))
+                    continue; // Старший коэффициент != 1 — не подходит
+
+                std::vector<T> coeffs;
+                T temp = m_N;
+                for (uint32_t i = 0; i < d_try; ++i) {
+                    auto [q, r] = ::bignum::siqs::div_rem(temp, cand);
+                    coeffs.push_back(r);
+                    temp = q;
+                }
+                coeffs.push_back(temp);
+
+                uint32_t score = poly_score(coeffs);
+                if (score < best_score) {
+                    best_score = score;
+                    m_d = d_try;
+                    m_m = cand;
+                    m_coeffs = std::move(coeffs);
+                    found = true;
+                }
             }
         }
 
-        m_coeffs.clear();
-        T temp = m_N;
-        for (uint32_t i = 0; i < m_d; ++i) {
-            auto [q, r] = ::bignum::siqs::div_rem(temp, m_m);
-            m_coeffs.push_back(r);
-            temp = q;
-        }
-        m_coeffs.push_back(temp);
-
-        return (temp == T(1));
+        return found && m_coeffs.size() == static_cast<size_t>(m_d) + 1;
     }
 
     bool build_factor_bases(size_t rfb_target, size_t afb_target, size_t qcb_target)
@@ -535,38 +825,186 @@ private:
         uint64_t max_rfb_p = m_RFB.back().p;
         uint64_t max_afb_p = m_AFB.back().p;
 
-        // Не раздуваем пул LP, чтобы они постоянно сталкивались в пары:
-        m_L_rat_max = max_rfb_p * 250ULL; // ~1.6 млн
-        m_L_alg_max = max_afb_p * 250ULL; // ~1.8 млн
+        // Граница large prime из параметров (p_max * lp_mult); пул не раздуваем,
+        // чтобы одиночные LP постоянно сталкивались в пары:
+        m_L_rat_max = max_rfb_p * m_lp_mult;
+        m_L_alg_max = max_afb_p * m_lp_mult;
 
         return true;
+    }
+
+    // Оценка достижимости: интеграл плотности гладких пар по всей области
+    // решета (|a| <= A, b <= max_b) квадратурой по лог-сеткам. Равномерная
+    // или «малопарная» выборка не годится: вклад дают только пары с малыми
+    // |a| и b (нормы растут как m*(|a|+b)^d), а их доля мала. Считаем
+    // rho(u_rat)*rho(u_alg) по узлам сетки и домножаем на ширины интервалов.
+    // Если ожидание ниже нужного числа строк — честный отказ сразу, без
+    // многочасового пустого прогона.
+    bool estimate_feasibility(std::function<void(const std::string &)> status_cb)
+    {
+        const double log2_pr = std::log2(static_cast<double>(m_RFB.back().p));
+        const double log2_pa = std::log2(static_cast<double>(m_AFB.back().p));
+
+        // Лог-сетки: b и |a|. Точки концентрируются у малых значений, где
+        // интегранд ненулевой.
+        constexpr int NUM_B = 40;
+        constexpr int NUM_A = 40;
+        auto make_grid = [](double hi, int n) {
+            std::vector<double> g;
+            double ratio = std::pow(hi, 1.0 / (n - 1));
+            double v = 1.0;
+            for (int i = 0; i < n; ++i) {
+                g.push_back(v);
+                v *= ratio;
+            }
+            g.back() = hi;
+            return g;
+        };
+        std::vector<double> b_grid = make_grid(static_cast<double>(m_max_b), NUM_B);
+        std::vector<double> a_grid = make_grid(static_cast<double>(m_sieve_A), NUM_A);
+
+        double expected = 0.0;
+        // Запас от больших простых (одиночный LP заметно повышает вероятность;
+        // коэффициент консервативный).
+        const double lp_boost = 2.0;
+
+        for (int i = 0; i < NUM_B; ++i) {
+            double b_lo = b_grid[static_cast<size_t>(i)];
+            double b_hi = (i + 1 < NUM_B) ? b_grid[static_cast<size_t>(i + 1)]
+                                          : static_cast<double>(m_max_b) * 1.5;
+            double b_mid = 0.5 * (b_lo + b_hi);
+            double width_b = b_hi - b_lo;
+            uint32_t b_val = static_cast<uint32_t>(std::max(1.0, std::round(b_mid)));
+
+            for (int j = 0; j < NUM_A; ++j) {
+                double a_lo = a_grid[static_cast<size_t>(j)];
+                double a_hi = (j + 1 < NUM_A) ? a_grid[static_cast<size_t>(j + 1)]
+                                              : static_cast<double>(m_sieve_A) * 1.5;
+                double a_mid = 0.5 * (a_lo + a_hi);
+                // Оба знака a.
+                double width_a = 2.0 * (a_hi - a_lo);
+                int64_t a_val = std::max<int64_t>(1, static_cast<int64_t>(std::round(a_mid)));
+
+                T bm = T(b_val) * m_m;
+                T abs_a(static_cast<uint64_t>(a_val));
+                T rat_norm = (abs_a >= bm) ? (abs_a - bm) : (bm - abs_a);
+                if (rat_norm == T(0))
+                    continue;
+                bool neg = false;
+                T alg_norm = eval_homogeneous_poly(m_coeffs, a_val, b_val, neg);
+                if (alg_norm == T(0))
+                    continue;
+
+                double ur = static_cast<double>(rat_norm.bit_width()) / log2_pr;
+                double ua = static_cast<double>(alg_norm.bit_width()) / log2_pa;
+                double p_pair = std::pow(10.0, log10_dickman(ur) + log10_dickman(ua));
+                expected += p_pair * width_b * width_a;
+            }
+        }
+        expected *= lp_boost;
+
+        // Эмпирическая калибровка: rho-оценка систематически завышает выход
+        // в ~2 раза (корреляция гладкости двух норм, кратности, пороги решета).
+        // Замеры: 128 бит — предсказание 4.8e4 при фактическом выходе ~2.4e4;
+        // 144 бит — 1.4e4 против ~7e3.
+        expected *= 0.5;
+
+        if (status_cb) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "GNFS: Оценка по области решета: ожидается ~%.3g строк "
+                          "(нужно %zu, базы %llu / %llu)",
+                          expected, m_relations_needed,
+                          static_cast<unsigned long long>(m_RFB.back().p),
+                          static_cast<unsigned long long>(m_AFB.back().p));
+            status_cb(buf);
+        }
+
+        if (expected < static_cast<double>(m_relations_needed)) {
+            if (status_cb) {
+                char buf[384];
+                std::snprintf(buf, sizeof(buf),
+                              "GNFS: Задача оценена как нереалистичная для этой "
+                              "реализации (ожидается ~%.3g строк, нужно %zu при "
+                              "базах %llu / %llu). Число слишком велико: нужен, "
+                              "например, CADO-NFS на кластере.",
+                              expected, m_relations_needed,
+                              static_cast<unsigned long long>(m_RFB.back().p),
+                              static_cast<unsigned long long>(m_AFB.back().p));
+                status_cb(buf);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // Объединение двух соотношений, разделяющих одни и те же большие простые,
+    // в одну строку (LP-пары становятся полными квадратами). Поля больших
+    // простых выставляет вызывающий код — они различаются по типу спаривания.
+    static GNFSRelation<T> combine_pair(const GNFSRelation<T> &first,
+                                        const GNFSRelation<T> &second)
+    {
+        GNFSRelation<T> combined;
+        combined.a = first.a;
+        combined.b = first.b;
+        combined.has_pair = true;
+        combined.a2 = second.a;
+        combined.b2 = second.b;
+        combined.rat_neg = (first.rat_neg != second.rat_neg);
+        combined.alg_neg = (first.alg_neg != second.alg_neg);
+
+        merge_factor_lists(first.rat_idx, first.rat_pow, second.rat_idx, second.rat_pow,
+                           combined.rat_idx, combined.rat_pow);
+        merge_factor_lists(first.alg_idx, first.alg_pow, second.alg_idx, second.alg_pow,
+                           combined.alg_idx, combined.alg_pow);
+        return combined;
     }
 
     void sieve_worker(std::atomic<uint32_t> &b_counter,
                       std::function<void(const std::string &)> status_cb)
     {
         const int M = m_sieve_A;
-        std::vector<uint8_t> rat_sieve(2 * M, 0);
-        std::vector<uint8_t> alg_sieve(2 * M, 0);
+        // log2-суммы гладких кандидатов у крупных баз превышают 255,
+        // поэтому храним в uint16, а не в uint8.
+        std::vector<uint16_t> rat_sieve(2 * M, 0);
+        std::vector<uint16_t> alg_sieve(2 * M, 0);
 
-        // Разрешаем остаткам после решета быть больше,
-        // давая возможность находить числа с одним Large Prime (до p_max^2):
-        uint8_t l_rat_slack = m_RFB.back().log_p * 3 + 8;
-        uint8_t l_alg_slack = m_AFB.back().log_p * 3 + 12;
+        // Запас предфильтра "лог решета + запас < log2 нормы": граница LP
+        // плюс подстраховка на кратности (решето добавляет log p один раз).
+        auto lp_bits_of = [](uint64_t v) -> uint32_t {
+            return (v > 1) ? static_cast<uint32_t>(64 - std::countl_zero(v - 1)) : 0u;
+        };
+        const uint32_t lp_slack_rat = lp_bits_of(m_L_rat_max) + 20;
+        const uint32_t lp_slack_alg = lp_bits_of(m_L_alg_max) + 20;
 
-        constexpr uint32_t MAX_B = 60000;
+        const uint32_t max_b = m_max_b;
         while (!m_done.load(std::memory_order_relaxed) && !::u128::Globals::LoadStop()) {
             uint32_t b = b_counter.fetch_add(1);
-            if (b > MAX_B)
+            if (b > max_b)
                 break;
 
+            // Статус — не чаще раза в 700 мс на все потоки (m_rel_mutex
+            // сериализует вывод; иначе статусы залипают тысячами строк).
             if (status_cb && (b % 10 == 0)) {
                 std::lock_guard<std::mutex> lock(m_rel_mutex);
-                if (!m_done.load(std::memory_order_relaxed)) {
-                    status_cb("GNFS: Сбор соотношений: " + std::to_string(m_relations.size())
-                              + " / " + std::to_string(m_relations_needed)
-                              + " (пар: " + std::to_string(m_combined_count)
-                              + ", b=" + std::to_string(b) + ")");
+                auto now = std::chrono::steady_clock::now();
+                if (!m_done.load(std::memory_order_relaxed)
+                    && now - m_last_status > std::chrono::milliseconds(700)) {
+                    m_last_status = now;
+                    double secs = std::chrono::duration<double>(now - m_sieve_start).count();
+                    size_t ready = m_full_relations_count + m_combined_count;
+                    double rate = (secs > 1.0) ? static_cast<double>(ready) / secs : 0.0;
+                    double rest = (m_relations_needed > ready)
+                                      ? static_cast<double>(m_relations_needed - ready)
+                                      : 0.0;
+                    double eta_min = (rate > 0.0) ? (rest / rate) / 60.0 : 0.0;
+                    status_cb("GNFS: Сбор соотношений: " + std::to_string(ready) + " / "
+                              + std::to_string(m_relations_needed) + " (чистых: "
+                              + std::to_string(m_full_relations_count) + ", пар: "
+                              + std::to_string(m_combined_count) + ", b=" + std::to_string(b)
+                              + ", " + std::to_string(static_cast<int>(rate)) + " строк/с, ~"
+                              + std::to_string(static_cast<int>(eta_min)) + " мин)");
                 }
             }
 
@@ -617,24 +1055,18 @@ private:
             constexpr int NUM_BLOCKS = 16;
             const int block_len = (2 * M) / NUM_BLOCKS;
 
-            // Пороги подобраны под базы ~3000/5000 (см. замеры): заниженные
-            // пороги (22/27) пропускали в перебор на деление ~10x больше кандидатов,
-            // почти не добавляя строк. Гладкие соотношения проходят с большим запасом.
-            const uint8_t rat_thresh = 28;
-            const uint8_t alg_thresh = 34;
+            // Пороги выводятся из реального m (см. solve): для проверенной
+            // точки 128 бит (m=2^32) получается ровно 28/34.
+            const uint8_t rat_thresh = m_rat_thresh;
+            const uint8_t alg_thresh = m_alg_thresh;
 
             for (int blk = 0; blk < NUM_BLOCKS; ++blk) {
                 int j_start = blk * block_len;
                 int j_end = (blk == NUM_BLOCKS - 1) ? (2 * M) : (j_start + block_len);
 
-                static std::atomic<uint64_t> stat_sieve_hits{0};
-                static std::atomic<uint64_t> stat_rfb_fail{0};
-                static std::atomic<uint64_t> stat_afb_fail{0};
-                static std::atomic<uint64_t> stat_success{0};
-
                 for (int j = j_start; j < j_end; ++j) {
                     if (rat_sieve.at(j) >= rat_thresh && alg_sieve.at(j) >= alg_thresh) {
-                        stat_sieve_hits++;
+                        m_stat_hits++;
                         int64_t a = static_cast<int64_t>(j) - M;
                         if (a == 0)
                             continue;
@@ -661,31 +1093,44 @@ private:
                         if (rat_norm == T(0))
                             continue;
 
-                        std::vector<uint32_t> r_idx;
-                        std::vector<uint16_t> r_pow;
-                        uint64_t large_rat = 1;
-                        if (!factor_over_rfb(rat_norm, r_idx, r_pow, large_rat)) {
-                            stat_rfb_fail++;
-                            continue;
-                        }
-
                         bool alg_neg = false;
                         T alg_norm = eval_homogeneous_poly(m_coeffs, a, b, alg_neg);
                         if (alg_norm == T(0))
                             continue;
+
+                        // Предфильтр по логам решета: решето не видит большие
+                        // простые и кратности, поэтому его сумма занижает log2
+                        // нормы. Если "лог решета + граница LP + запас" всё же
+                        // меньше реальной длины нормы — в норме есть крупный
+                        // простой вне базы, деление бессмысленно. Отсекает
+                        // подавляющее большинство кандидатов за пару сравнений.
+                        if (static_cast<uint32_t>(rat_sieve.at(j)) + lp_slack_rat
+                            < rat_norm.bit_width()) {
+                            m_stat_pre_rat_fail++;
+                            continue;
+                        }
+                        if (static_cast<uint32_t>(alg_sieve.at(j)) + lp_slack_alg
+                            < alg_norm.bit_width()) {
+                            m_stat_pre_alg_fail++;
+                            continue;
+                        }
+
+                        std::vector<uint32_t> r_idx;
+                        std::vector<uint16_t> r_pow;
+                        uint64_t large_rat = 1;
+                        if (!factor_over_rfb(rat_norm, r_idx, r_pow, large_rat)) {
+                            m_stat_rat_fail++;
+                            continue;
+                        }
 
                         std::vector<uint32_t> a_idx;
                         std::vector<uint16_t> a_pow;
                         uint64_t large_alg = 1;
                         uint32_t large_alg_r = 0;
                         if (!factor_over_afb(alg_norm, a, b, a_idx, a_pow, large_alg, large_alg_r)) {
-                            stat_afb_fail++;
+                            m_stat_afb_fail++;
                             continue;
                         }
-
-                        // Отбрасываем соотношения с двумя большими простыми одновременно:
-                        if (large_rat > 1 && large_alg > 1)
-                            continue;
 
                         uint64_t ab_key = (static_cast<uint64_t>(static_cast<uint32_t>(a + M)) << 32)
                                           | b;
@@ -708,11 +1153,31 @@ private:
                             if (!m_seen_ab.insert(ab_key).second)
                                 continue;
 
+                            // 0. Большие простые с ОБЕИХ сторон: спариваем по
+                            // точному совпадению пары (ratLP, algLP + корень) —
+                            // обе составляющие взаимно уничтожаются (квадраты).
+                            if (large_rat > 1 && large_alg > 1) {
+                                auto key = std::make_pair(
+                                    large_rat,
+                                    (static_cast<uint64_t>(large_alg) << 32) | large_alg_r);
+                                auto it = m_dblp_partials.find(key);
+                                if (it == m_dblp_partials.end()) {
+                                    m_dblp_partials.emplace(key, std::move(rel));
+                                } else {
+                                    GNFSRelation<T> combined = combine_pair(it->second, rel);
+                                    combined.large_rat_p = large_rat; // q^2 -> +2 в X
+                                    combined.large_alg_p = 1;
+                                    m_relations.push_back(std::move(combined));
+                                    m_dblp_partials.erase(it);
+                                    m_combined_count++;
+                                    m_stat_success++;
+                                }
+                            }
                             // 1. Полностью гладкое соотношение (0-LP)
-                            if (large_rat == 1 && large_alg == 1) {
+                            else if (large_rat == 1 && large_alg == 1) {
                                 m_relations.push_back(std::move(rel));
                                 m_full_relations_count++;
-                                stat_success++;
+                                m_stat_success++;
                             }
                             // 2. Рациональный Large Prime (1-LP)
                             else if (large_rat > 1) {
@@ -720,37 +1185,15 @@ private:
                                 if (it == m_rat_partials.end()) {
                                     m_rat_partials.emplace(large_rat, std::move(rel));
                                 } else {
-                                    // Найдена пара! Объединяем их в одну выживающую строку:
-                                    GNFSRelation<T> combined;
-                                    combined.a = it->second.a;
-                                    combined.b = it->second.b;
-                                    combined.has_pair = true;
-                                    combined.a2 = rel.a;
-                                    combined.b2 = rel.b;
-                                    combined.rat_neg = (it->second.rat_neg != rel.rat_neg);
-                                    combined.alg_neg = (it->second.alg_neg != rel.alg_neg);
-
-                                    merge_factor_lists(it->second.rat_idx,
-                                                       it->second.rat_pow,
-                                                       rel.rat_idx,
-                                                       rel.rat_pow,
-                                                       combined.rat_idx,
-                                                       combined.rat_pow);
-                                    merge_factor_lists(it->second.alg_idx,
-                                                       it->second.alg_pow,
-                                                       rel.alg_idx,
-                                                       rel.alg_pow,
-                                                       combined.alg_idx,
-                                                       combined.alg_pow);
-
+                                    // Найдена пара! Объединяем их в одну строку:
+                                    GNFSRelation<T> combined = combine_pair(it->second, rel);
                                     combined.large_rat_p
                                         = large_rat; // Квадрат L^2 взаимно уничтожится mod 2
                                     combined.large_alg_p = 1;
-
                                     m_relations.push_back(std::move(combined));
                                     m_rat_partials.erase(it);
                                     m_combined_count++;
-                                    stat_success++;
+                                    m_stat_success++;
                                 }
                             }
                             // 3. Алгебраический Large Prime (1-LP)
@@ -760,32 +1203,10 @@ private:
                                 if (it == m_alg_partials.end()) {
                                     m_alg_partials.emplace(alg_key, std::move(rel));
                                 } else {
-                                    GNFSRelation<T> combined;
-                                    combined.a = it->second.a;
-                                    combined.b = it->second.b;
-                                    combined.has_pair = true;
-                                    combined.a2 = rel.a;
-                                    combined.b2 = rel.b;
-                                    combined.rat_neg = (it->second.rat_neg != rel.rat_neg);
-                                    combined.alg_neg = (it->second.alg_neg != rel.alg_neg);
-
-                                    merge_factor_lists(it->second.rat_idx,
-                                                       it->second.rat_pow,
-                                                       rel.rat_idx,
-                                                       rel.rat_pow,
-                                                       combined.rat_idx,
-                                                       combined.rat_pow);
-                                    merge_factor_lists(it->second.alg_idx,
-                                                       it->second.alg_pow,
-                                                       rel.alg_idx,
-                                                       rel.alg_pow,
-                                                       combined.alg_idx,
-                                                       combined.alg_pow);
-
+                                    GNFSRelation<T> combined = combine_pair(it->second, rel);
                                     combined.large_rat_p = 1;
                                     combined.large_alg_p = large_alg;
                                     combined.large_alg_r = large_alg_r;
-
                                     m_relations.push_back(std::move(combined));
                                     m_alg_partials.erase(it);
                                     m_combined_count++;
@@ -793,14 +1214,8 @@ private:
                             }
 
                             size_t total_ready = m_full_relations_count + m_combined_count;
-                            if (status_cb && total_ready % 20 == 0) {
-                                status_cb("GNFS: Сбор соотношений: " + std::to_string(total_ready)
-                                          + " / " + std::to_string(m_relations_needed)
-                                          + " (чистых: " + std::to_string(m_full_relations_count)
-                                          + ", пар: " + std::to_string(m_combined_count) + ")");
-                            }
-
-                            // Останавливаемся ТОЛЬКО когда готовых (гарантированно парных) строк достаточно!
+                            // Останавливаемся ТОЛЬКО когда готовых (гарантированно
+                            // парных) строк достаточно!
                             if (total_ready >= m_relations_needed) {
                                 m_done.store(true, std::memory_order_relaxed);
                                 return;
@@ -810,9 +1225,10 @@ private:
                 }
             }
         }
-        if (b_counter.load() > MAX_B && !m_done.load()) {
+        if (b_counter.load() > m_max_b && !m_done.load()) {
             if (status_cb) {
-                status_cb("GNFS: Исчерпан лимит b. Собрано строк: "
+                status_cb("GNFS: Исчерпан лимит b ("
+                          + std::to_string(m_max_b) + "). Собрано строк: "
                           + std::to_string(m_relations.size()) + " / "
                           + std::to_string(m_relations_needed));
                 std::this_thread::sleep_for(std::chrono::milliseconds(5000));
@@ -1268,7 +1684,12 @@ private:
         uint32_t q = 0;
         std::vector<uint32_t> f_mod_q(m_d + 1, 0);
 
-        for (uint32_t cand = 2003; cand < 50000; cand += 4) {
+        // Подбираем КРУПНЕЙШее допустимое q (< 2^16, ≡ 3 mod 4): каждая цифра
+        // базы q несёт ~16 бит вместо ~11 у крошечного q≈2000, число цифр K
+        // падает в ~1.5 раза, а все операции в базе q (дерево произведений,
+        // подъём Ньютона) стоят O(K^2) — суммарный выигрыш ~2.5x на извлечении
+        // корня. Проверка неприводимости — быстрая (Фробениус), O(d^3 log q).
+        for (uint32_t cand = 65519; cand >= 2003; cand -= 4) {
             bool is_p = true;
             for (uint32_t div = 3; 1ULL * div * div <= cand; div += 2) {
                 if (cand % div == 0) {
@@ -1282,7 +1703,7 @@ private:
             for (size_t i = 0; i <= m_d; ++i) {
                 f_mod_q.at(i) = ::bignum::siqs::rem_u32(m_coeffs.at(i), cand);
             }
-            if (is_irreducible_mod_q(f_mod_q, cand)) {
+            if (is_irreducible_mod_q_fast(f_mod_q, cand)) {
                 q = cand;
                 break;
             }
@@ -1469,8 +1890,11 @@ private:
         if (!sqrt_field_ok)
             return std::nullopt;
 
-        // 3. Оцениваем глубину подъема K (в разрядах по основанию q)
-        size_t total_bits_needed = (pairs.size() * (m_m.bit_width() + 20)) / 2 + m_N.bit_width() * 2
+        // 3. Оцениваем глубину подъема K (в разрядах по основанию q).
+        // Коэффициенты целочисленного корня g (если он существует) имеют порядок
+        // ~2^(пара·27) бит (максимальное вложение |a - b*rho| ~ b*m); чтобы
+        // центрированное представление не «заворачивалось», берём запас ×2.
+        size_t total_bits_needed = (pairs.size() * (m_m.bit_width() + 20)) + m_N.bit_width() * 2
                                    + 128;
         size_t q_bits = static_cast<size_t>(std::max(10.0, std::floor(std::log2(q))));
         size_t target_K = (total_bits_needed + q_bits - 1) / q_bits + 4;
@@ -1546,6 +1970,41 @@ private:
         }
 
         auto sqrt_rq = poly_mul_radix_q(prod_full, S, f_full, q, target_K);
+
+#ifndef NDEBUG
+        // ДИАГНОСТИКА: самопроверка подъёма — sqrt_rq^2 == P (mod q^K) поцифрово.
+        // Если сломан подъём — BROKEN; если OK, а Y^2 != X^2, то единица в Z[alpha]
+        // не является квадратом (подъём даёт q-адический, а не целочисленный корень)
+        // либо целочисленный корень не поместился в q^K (тогда used_bits ~= K*q_bits).
+        {
+            auto sq_full = poly_mul_radix_q(sqrt_rq, sqrt_rq, f_full, q, target_K);
+            bool ok_K = true;
+            for (size_t i = 0; i < m_d && ok_K; ++i) {
+                if (sq_full.at(i) != prod_full.at(i))
+                    ok_K = false;
+            }
+            // «Использованные биты» центрированного корня: сколько старших цифр
+            // занято знаковыми разрядами (0 — для положительных, q-1 — для отрицательных).
+            size_t q_bits_diag = static_cast<size_t>(std::max(10.0, std::floor(std::log2(q))));
+            size_t used_bits = 0;
+            for (size_t i = 0; i < m_d; ++i) {
+                const RadixQ &c = sqrt_rq.at(i);
+                uint32_t fill = (c.back() > q / 2) ? (q - 1) : 0;
+                size_t first = 0;
+                while (first < target_K && c.at(target_K - 1 - first) == fill)
+                    ++first;
+                size_t bits_here = (target_K - first) * q_bits_diag;
+                if (bits_here > used_bits)
+                    used_bits = bits_here;
+            }
+            std::fprintf(stderr,
+                         "DIAG sqrt: q=%u target_K=%zu (%zu бит) pairs=%zu negate=%d "
+                         "sqrt^2==P(mod q^K):%s used_bits=%zu\n",
+                         q, target_K, target_K * q_bits_diag, pairs.size(),
+                         static_cast<int>(negate_prod), ok_K ? "OK" : "BROKEN", used_bits);
+            std::fflush(stderr);
+        }
+#endif // NDEBUG
 
         // 5. Переводим центрированные коэффициенты из базы q в Z_N и подставляем x = m
         T Y = T(0);
@@ -1689,6 +2148,13 @@ private:
         size_t sqrt_ok = 0;
         size_t sq_match = 0;
 
+        // Нулевые строки = базис ядра. Базисные векторы МОГУТ все давать один и
+        // тот же «неквадратный» класс (единица/класс кольца Z[alpha]) — тогда ни
+        // один прямой вектор не даст целочисленного корня, хотя комбинации дают.
+        // Любая сумма векторов ядра тоже вектор ядра, поэтому перебираем и их:
+        // v0, v1, v0^v1, затем для j>=2: vj, vj^v0, vj^v1, vj^v0^v1 — это покрывает
+        // все 4 сочетания по первым двум направлениям ядра для каждого j.
+        std::vector<size_t> null_list;
         for (size_t r = 0; r < M; ++r) {
             bool all_zero = true;
             for (size_t w = 0; w < words; ++w) {
@@ -1697,16 +2163,54 @@ private:
                     break;
                 }
             }
-            if (!all_zero)
-                continue;
+            if (all_zero)
+                null_list.push_back(r);
+        }
+
+        std::vector<uint64_t> hist_comb(hist_words, 0);
+        const size_t total_attempts =
+            3 + (null_list.size() > 2 ? (null_list.size() - 2) * 4 : 0);
+        for (size_t attempt = 0; attempt < total_attempts; ++attempt) {
+            if (::u128::Globals::LoadStop())
+                break;
+            size_t j, mask;
+            if (attempt == 0) {
+                j = 0;
+                mask = 0; // v0
+            } else if (attempt == 1) {
+                j = 1;
+                mask = 0; // v1
+            } else if (attempt == 2) {
+                j = 0;
+                mask = 2; // v0 ^ v1
+            } else {
+                j = (attempt - 3) / 4 + 2;
+                mask = (attempt - 3) % 4;
+            }
+            if (j >= null_list.size())
+                break;
+            if ((mask & 3) != 0 && null_list.size() < 2)
+                break;
 
             null_rows++;
+            // comb = v_j ^ (mask&1 ? v0 : 0) ^ (mask&2 ? v1 : 0)
+            std::copy(matrix[null_list[j]].history.begin(),
+                      matrix[null_list[j]].history.end(), hist_comb.begin());
+            if (mask & 1) {
+                for (size_t w = 0; w < hist_words; ++w)
+                    hist_comb[w] ^= matrix[null_list[0]].history[w];
+            }
+            if (mask & 2) {
+                for (size_t w = 0; w < hist_words; ++w)
+                    hist_comb[w] ^= matrix[null_list[1]].history[w];
+            }
+
             std::vector<uint64_t> rfb_powers(rfb_len, 0);
             std::unordered_map<uint64_t, uint64_t> lp_rat_counts;
             std::vector<size_t> dep_rels;
 
             for (size_t local_idx = 0; local_idx < M; ++local_idx) {
-                if (matrix[r].history[local_idx / 64] & (1ULL << (local_idx % 64))) {
+                if (hist_comb[local_idx / 64] & (1ULL << (local_idx % 64))) {
                     dep_rels.push_back(local_idx);
                     const auto &rel = m_relations[local_idx];
                     for (size_t i = 0; i < rel.rat_idx.size(); ++i) {
@@ -1771,6 +2275,135 @@ private:
             ::bignum::siqs::square_mod(X2, m_N);
             T Y2 = Y;
             ::bignum::siqs::square_mod(Y2, m_N);
+
+#ifndef NDEBUG
+            // ДИАГНОСТИКА: прямой пересчёт P(m) = f'(m)^2 * prod(a - b*m) (mod N).
+            // Сверка X^2 и Y^2 с ним локализует ошибку: X^2!=P(m) — сторона X/матрицы,
+            // Y^2!=P(m) — извлечение корня.
+            if (status_cb && null_rows <= 3) {
+                // Точная сверка факторизаций соотношений в связи (без переполнений —
+                // делением): ∏p^e · LP^2 == |F(a,b)| (·|F(a2,b2)|). Несовпадение
+                // означает баг разложения/спаривания (элементарная ошибка), совпадение
+                // при Y^2!=P(m) — «неквадратная» единица в Z[alpha] или баг подъёма.
+                size_t bad_rat = 0, bad_alg = 0;
+                auto divide_out = [](T &q, uint32_t p, uint16_t &e) {
+                    while (e > 0 && ::bignum::siqs::rem_u32(q, p) == 0) {
+                        q = ::bignum::siqs::div_by_u32(q, p);
+                        --e;
+                    }
+                };
+                for (size_t idx : dep_rels) {
+                    const auto &rel2 = m_relations[idx];
+                    // Алгебраическая сторона: |F(a,b)| и |F(a2,b2)| против alg_idx/alg_pow + LP^2
+                    bool f_neg = false;
+                    T fa = eval_homogeneous_poly(m_coeffs, rel2.a, rel2.b, f_neg);
+                    T fb(1);
+                    if (rel2.has_pair)
+                        fb = eval_homogeneous_poly(m_coeffs, rel2.a2, rel2.b2, f_neg);
+                    bool ok_a = true;
+                    for (size_t k = 0; k < rel2.alg_idx.size() && ok_a; ++k) {
+                        uint16_t e = rel2.alg_pow[k];
+                        uint32_t p = m_AFB.at(rel2.alg_idx[k]).p;
+                        divide_out(fa, p, e);
+                        if (e > 0 && fb != T(1)) {
+                            divide_out(fb, p, e);
+                        }
+                        if (e > 0)
+                            ok_a = false;
+                    }
+                    if (ok_a && rel2.large_alg_p > 1) {
+                        uint32_t p32 = static_cast<uint32_t>(rel2.large_alg_p);
+                        uint16_t e2 = 2;
+                        divide_out(fa, p32, e2);
+                        if (e2 > 0 && fb != T(1))
+                            divide_out(fb, p32, e2);
+                        if (e2 > 0)
+                            ok_a = false;
+                    }
+                    if (ok_a && (fa != T(1) || fb != T(1)))
+                        ok_a = false;
+                    if (!ok_a)
+                        ++bad_alg;
+
+                    // Рациональная сторона: ∏|a-bm| против rat_idx/rat_pow + LP^2
+                    T ra(static_cast<uint64_t>(rel2.a >= 0 ? rel2.a : -rel2.a));
+                    T rbv(T(rel2.b) * m_m);
+                    T rat_abs = (ra >= rbv) ? (ra - rbv) : (rbv - ra);
+                    T rat2(1);
+                    if (rel2.has_pair) {
+                        T ra2(static_cast<uint64_t>(rel2.a2 >= 0 ? rel2.a2 : -rel2.a2));
+                        T rb2v(T(rel2.b2) * m_m);
+                        rat2 = (ra2 >= rb2v) ? (ra2 - rb2v) : (rb2v - ra2);
+                    }
+                    bool ok_r = true;
+                    for (size_t k = 0; k < rel2.rat_idx.size() && ok_r; ++k) {
+                        uint16_t e = rel2.rat_pow[k];
+                        uint32_t p = m_RFB.at(rel2.rat_idx[k]).p;
+                        divide_out(rat_abs, p, e);
+                        if (e > 0 && rat2 != T(1))
+                            divide_out(rat2, p, e);
+                        if (e > 0)
+                            ok_r = false;
+                    }
+                    if (ok_r && rel2.large_rat_p > 1) {
+                        uint32_t p32 = static_cast<uint32_t>(rel2.large_rat_p);
+                        uint16_t e2 = 2;
+                        divide_out(rat_abs, p32, e2);
+                        if (e2 > 0 && rat2 != T(1))
+                            divide_out(rat2, p32, e2);
+                        if (e2 > 0)
+                            ok_r = false;
+                    }
+                    if (ok_r && (rat_abs != T(1) || rat2 != T(1)))
+                        ok_r = false;
+                    if (!ok_r)
+                        ++bad_rat;
+                }
+
+                size_t pair_cnt = 0;
+                size_t neg_cnt = 0;
+                T prod_m(1);
+                for (size_t idx : dep_rels) {
+                    const auto &rel2 = m_relations[idx];
+                    auto mul_ab = [&](int64_t aa, uint32_t bb) {
+                        ++pair_cnt;
+                        T bmv = T(bb) * m_m;
+                        T val;
+                        if (aa >= 0) {
+                            T av(static_cast<uint64_t>(aa));
+                            if (av >= bmv) {
+                                val = av - bmv;
+                            } else {
+                                val = m_N - (bmv - av);
+                                ++neg_cnt;
+                            }
+                        } else {
+                            val = m_N - (bmv + T(static_cast<uint64_t>(-aa)));
+                            ++neg_cnt;
+                        }
+                        ::bignum::siqs::mult_mod(prod_m, val, m_N);
+                    };
+                    mul_ab(rel2.a, rel2.b);
+                    if (rel2.has_pair)
+                        mul_ab(rel2.a2, rel2.b2);
+                }
+                T fd2 = f_deriv_m;
+                ::bignum::siqs::square_mod(fd2, m_N);
+                ::bignum::siqs::mult_mod(prod_m, fd2, m_N);
+                bool x_ok = (X2 == prod_m);
+                bool y_ok = (Y2 == prod_m);
+                T neg_prod_m = (prod_m == T(0)) ? T(0) : (m_N - prod_m); // -P(m) mod N
+                bool y_neg_ok = (Y2 == neg_prod_m);
+                status_cb("GNFS: ДИАГ: вектор #" + std::to_string(null_rows)
+                          + " пар=" + std::to_string(pair_cnt)
+                          + " отр.норм=" + std::to_string(neg_cnt)
+                          + " битых разл. рац/алг=" + std::to_string(bad_rat) + "/" + std::to_string(bad_alg)
+                          + " X^2==P(m):" + (x_ok ? "ДА" : "НЕТ")
+                          + " Y^2==P(m):" + (y_ok ? "ДА" : "НЕТ")
+                          + " Y^2==-P(m):" + (y_neg_ok ? "ДА" : "НЕТ"));
+            }
+#endif // NDEBUG
+
             if (X2 == Y2)
                 sq_match++;
 
@@ -1796,12 +2429,14 @@ private:
             }
         }
 
+#ifndef NDEBUG
         if (status_cb) {
             status_cb("DEBUG: rels=" + std::to_string(M) + " | cols=" + std::to_string(total_cols)
                       + " | null=" + std::to_string(null_rows) + " | sqrt="
                       + std::to_string(sqrt_ok) + " | match=" + std::to_string(sq_match));
             std::this_thread::sleep_for(std::chrono::seconds(6));
         }
+#endif // NDEBUG
         return std::nullopt;
     }
 };

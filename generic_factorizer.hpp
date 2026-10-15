@@ -967,10 +967,13 @@ template <typename T>
 T generate_semiprime(unsigned bitWidth,
                      T *p_out = nullptr,
                      T *q_out = nullptr,
-                     const std::function<void(uint64_t)> &progress = nullptr)
+                     const std::function<void(uint64_t)> &progress = nullptr,
+                     uint64_t seed = 0)
 {
     const unsigned half = bitWidth / 2;
     static thread_local std::mt19937_64 rng(std::random_device{}());
+    if (seed != 0) // Детерминированный режим (тесты/стенд): воспроизводимое число
+        rng.seed(seed);
     std::uniform_int_distribution<uint64_t> dist;
 
     // Случайное нечётное число с установленным старшим битом (ровно `bits` бит)
