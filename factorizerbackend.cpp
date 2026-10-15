@@ -23,8 +23,9 @@ struct FactorResult {
     bool completed = true;
 };
 
+// Случайное число полной ширины типа T (старший бит всегда установлен).
 template <typename T>
-T get_random_value() {
+T get_random_full() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
 
     if constexpr (std::is_same_v<T, ::bignum::u128::U128>) {
@@ -33,12 +34,27 @@ T get_random_value() {
         return ::bignum::u128::U128(lo, hi);
     } else if constexpr (requires { typename T::half_type; }) {
         using Half = typename T::half_type;
-        Half hi = get_random_value<Half>();
-        Half lo = get_random_value<Half>();
+        Half hi = get_random_full<Half>();
+        Half lo = get_random_full<Half>();
         return T(hi, lo);
     } else {
         return T(rng());
     }
+}
+
+// Случайное число с ровно bits битами (bits <= 0 — полная ширина типа T).
+// UI позволяет произвольную разрядность 64..512, поэтому полное число
+// усекается до нужного размера, а старший бит ставится заново —
+// иначе разрядность результата не совпала бы с выбранной.
+template <typename T>
+T get_random_value(int bits = 0) {
+    T v = get_random_full<T>();
+    const unsigned full = v.bit_width(); // == sizeof(T)*8
+    if (bits <= 0 || static_cast<unsigned>(bits) >= full)
+        return v;
+    v >>= (full - static_cast<unsigned>(bits));
+    v |= T(1) << (bits - 1);
+    return v;
 }
 
 // Конвертер списка множителей std::vector<T> в FactorResult<T> с подсчетом степеней
@@ -225,16 +241,24 @@ void FactorizerBackend::setResult(const QString &r) {
 QString FactorizerBackend::generateRandomNumber(int bitWidth) {
     using namespace bignum::generic_ecm;
 
+    // Тип подбираем по диапазону: UI разрешает произвольную разрядность
+    // 64..512, поэтому точный switch (128/256/512/...) больше не подходит.
+    // Число генерируется ровно такой битности, какая выбрана.
     std::string s;
-    switch (bitWidth) {
-    case 128:  s = get_random_value<U128>().toString(); break;
-    case 256:  s = get_random_value<U256>().toString(); break;
-    case 512:  s = get_random_value<U512>().toString(); break;
-    case 1024: s = get_random_value<U1024>().toString(); break;
-    case 2048: s = get_random_value<U2048>().toString(); break;
-    case 4096: s = get_random_value<U4096>().toString(); break;
-    default:   s = get_random_value<U128>().toString(); break;
-    }
+    if (bitWidth <= 128)
+        s = get_random_value<U128>(bitWidth).toString();
+    else if (bitWidth <= 256)
+        s = get_random_value<U256>(bitWidth).toString();
+    else if (bitWidth <= 512)
+        s = get_random_value<U512>(bitWidth).toString();
+    else if (bitWidth <= 1024)
+        s = get_random_value<U1024>(bitWidth).toString();
+    else if (bitWidth <= 2048)
+        s = get_random_value<U2048>(bitWidth).toString();
+    else if (bitWidth <= 4096)
+        s = get_random_value<U4096>(bitWidth).toString();
+    else
+        s = "0";
     return QString::fromStdString(s);
 }
 
@@ -256,16 +280,24 @@ void FactorizerBackend::generateSemiprime(int bitWidth) {
                           .arg(candidates));
         };
 
+        // Тип подбираем по диапазону, а запрошенная битность передаётся
+        // генератору как есть — он умеет произвольные значения, включая
+        // нечётные (65, 137, ...).
         std::string s;
-        switch (bitWidth) {
-        case 128:  s = generate_semiprime<U128>(128, nullptr, nullptr, progress).toString(); break;
-        case 256:  s = generate_semiprime<U256>(256, nullptr, nullptr, progress).toString(); break;
-        case 512:  s = generate_semiprime<U512>(512, nullptr, nullptr, progress).toString(); break;
-        case 1024: s = generate_semiprime<U1024>(1024, nullptr, nullptr, progress).toString(); break;
-        case 2048: s = generate_semiprime<U2048>(2048, nullptr, nullptr, progress).toString(); break;
-        case 4096: s = generate_semiprime<U4096>(4096, nullptr, nullptr, progress).toString(); break;
-        default:   s = generate_semiprime<U128>(128, nullptr, nullptr, progress).toString(); break;
-        }
+        if (bitWidth <= 128)
+            s = generate_semiprime<U128>(bitWidth, nullptr, nullptr, progress).toString();
+        else if (bitWidth <= 256)
+            s = generate_semiprime<U256>(bitWidth, nullptr, nullptr, progress).toString();
+        else if (bitWidth <= 512)
+            s = generate_semiprime<U512>(bitWidth, nullptr, nullptr, progress).toString();
+        else if (bitWidth <= 1024)
+            s = generate_semiprime<U1024>(bitWidth, nullptr, nullptr, progress).toString();
+        else if (bitWidth <= 2048)
+            s = generate_semiprime<U2048>(bitWidth, nullptr, nullptr, progress).toString();
+        else if (bitWidth <= 4096)
+            s = generate_semiprime<U4096>(bitWidth, nullptr, nullptr, progress).toString();
+        else
+            s = "0";
 
         bool cancelled = ::u128::Globals::LoadStop();
         setRunning(false);
@@ -319,8 +351,9 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     ::u128::Globals::SetStop(false);
 
     std::string stdStr = numberStr.trimmed().toStdString();
+    const int numberBits = static_cast<int>(val.bitLength);
 
-    std::thread([this, stdStr, bitWidth, skipEcm]() {
+    std::thread([this, stdStr, numberBits, skipEcm]() {
         using namespace bignum::generic_ecm;
         QElapsedTimer timer;
         timer.start();
@@ -377,56 +410,33 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
         };
 
         try {
-            switch (bitWidth) {
-            case 128: {
-                U128 val = U128::fromString(stdStr);
+            // Тип бигинта выбираем по фактической битности числа, а не по
+            // выбранной в UI разрядности: теперь она произвольная (64..512),
+            // а число должно помещаться в тип с запасом на промежуточные
+            // значения методов факторизации.
+            auto run = [&](auto tag) {
+                using T = typename decltype(tag)::type;
+                T val = T::fromString(stdStr);
                 auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            case 256: {
-                U256 val = U256::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
-                profiler.finish();
-                auto res = build_factor_result(raw_factors, val, m_userStopped.load());
-                output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            case 512: {
-                U512 val = U512::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
-                profiler.finish();
-                auto res = build_factor_result(raw_factors, val, m_userStopped.load());
-                output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            case 1024: {
-                U1024 val = U1024::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
-                profiler.finish();
-                auto res = build_factor_result(raw_factors, val, m_userStopped.load());
-                output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            case 2048: {
-                U2048 val = U2048::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
-                profiler.finish();
-                auto res = build_factor_result(raw_factors, val, m_userStopped.load());
-                output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            case 4096: {
-                U4096 val = U4096::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
-                profiler.finish();
-                auto res = build_factor_result(raw_factors, val, m_userStopped.load());
-                output = format_result(res, timer.elapsed(), profiler);
-                break;
-            }
-            }
+            };
+
+            if (numberBits <= 128)
+                run(std::type_identity<U128>{});
+            else if (numberBits <= 256)
+                run(std::type_identity<U256>{});
+            else if (numberBits <= 512)
+                run(std::type_identity<U512>{});
+            else if (numberBits <= 1024)
+                run(std::type_identity<U1024>{});
+            else if (numberBits <= 2048)
+                run(std::type_identity<U2048>{});
+            else if (numberBits <= 4096)
+                run(std::type_identity<U4096>{});
+            else
+                output = "Число больше 4096 бит: нет подходящего типа!";
         } catch (...) {
             output = "Ошибка при вычислении!";
         }

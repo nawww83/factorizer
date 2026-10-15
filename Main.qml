@@ -46,16 +46,8 @@ ApplicationWindow {
         if (!autoBitCheckBox.checked || inputBitLength <= 0 || backend.isRunning)
             return ;
 
-        var bitModels = bitCombo.model;
-        for (var i = 0; i < bitModels.length; ++i) {
-            if (inputBitLength <= bitModels[i]) {
-                if (bitCombo.currentIndex !== i)
-                    bitCombo.currentIndex = i;
-
-                return ;
-            }
-        }
-        bitCombo.currentIndex = bitModels.length - 1;
+        // Ближайшая разрядность, в которую помещается число (64..512)
+        bitSpin.value = Math.min(Math.max(inputBitLength, bitSpin.from), bitSpin.to);
     }
 
     width: 520
@@ -173,15 +165,18 @@ ApplicationWindow {
                 Layout.alignment: Qt.AlignVCenter
             }
 
-            ComboBox {
-                id: bitCombo
+            SpinBox {
+                id: bitSpin
 
-                // Больше 512 бит в программе нет работающего метода
-                // (SIQS ограничен 320 битами, GNFS этой реализации — 150),
-                // поэтому крупные размеры в интерфейс не выводим.
-                model: [128, 256, 512]
-                currentIndex: 0
-                implicitWidth: 90
+                // Произвольная разрядность 64..512. Больше 512 бит в программе
+                // нет работающего метода (SIQS ограничен 320 битами, GNFS этой
+                // реализации — 150), поэтому потолок именно 512.
+                from: 64
+                to: 512
+                stepSize: 1
+                value: 128
+                editable: true
+                implicitWidth: 115
                 enabled: !backend.isRunning && !autoBitCheckBox.checked
             }
 
@@ -218,7 +213,7 @@ ApplicationWindow {
                 implicitHeight: 28
                 enabled: !backend.isRunning
                 Layout.alignment: Qt.AlignVCenter
-                onClicked: backend.generateSemiprime(bitCombo.currentValue)
+                onClicked: backend.generateSemiprime(bitSpin.value)
             }
 
         }
@@ -256,7 +251,7 @@ ApplicationWindow {
                 }
                 font.pixelSize: 12
                 font.bold: true
-                color: window.inputBitLength > bitCombo.currentValue ? "#e53935" : (window.darkMode ? "#66bb6a" : "#2e7d32")
+                color: window.inputBitLength > bitSpin.value ? "#e53935" : (window.darkMode ? "#66bb6a" : "#2e7d32")
                 Layout.alignment: Qt.AlignVCenter
             }
 
@@ -383,7 +378,7 @@ ApplicationWindow {
                 implicitHeight: 36
                 enabled: !backend.isRunning
                 onClicked: {
-                    var rnd = backend.generateRandomNumber(bitCombo.currentValue);
+                    var rnd = backend.generateRandomNumber(bitSpin.value);
                     if (groupDigitsSwitch.checked)
                         inputField.text = formatDigitsByGroups(rnd, 10);
                     else
@@ -399,12 +394,12 @@ ApplicationWindow {
                 implicitHeight: 36
                 text: backend.isRunning ? "⏹ Остановить" : "▶ Факторизовать"
                 highlighted: !backend.isRunning
-                enabled: backend.isRunning || (sanitizeNumber(inputField.text).length > 0 && window.inputBitLength <= bitCombo.model[bitCombo.model.length - 1])
+                enabled: backend.isRunning || (sanitizeNumber(inputField.text).length > 0 && window.inputBitLength <= bitSpin.to)
                 onClicked: {
                     if (backend.isRunning)
                         backend.stop();
                     else
-                        backend.startFactorization(sanitizeNumber(inputField.text), bitCombo.currentValue);
+                        backend.startFactorization(sanitizeNumber(inputField.text), bitSpin.value);
                 }
 
                 background: Rectangle {
