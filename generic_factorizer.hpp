@@ -737,7 +737,8 @@ template <typename T>
 std::vector<T> factor_parallel_generic(T n,
                                        std::function<void(const std::string&)> status_cb = nullptr,
                                        ::bignum::StageProfiler* profiler = nullptr,
-                                       bool skip_ecm = false) {
+                                       bool skip_ecm = false,
+                                       bool gnfs_preferred = false) {
     std::vector<T> factors;
 
     if (n <= T(1)) return factors;
@@ -826,8 +827,11 @@ std::vector<T> factor_parallel_generic(T n,
         return factors;
     }
 
-    // 5. Быстрый запуск SIQS для чисел <= 135 бит (отрабатывает за доли секунды)
-    if (n.bit_width() <= 135) {
+    // 5. Быстрый запуск SIQS для чисел <= 135 бит (отрабатывает за доли секунды).
+    //    Исключение — ручной выбор GNFS в полосе 128-150 бит: иначе этот ярлык
+    //    успел бы позаимствовать запуск у GNFS, обойдя стадии 7-9.
+    const bool in_gnfs_band = n.bit_width() >= kGnfsMinBits && n.bit_width() <= kGnfsMaxBits;
+    if (n.bit_width() <= 135 && !(gnfs_preferred && in_gnfs_band)) {
         if (status_cb) status_cb("Запуск SIQS (быстрая факторизация)...");
         if (profiler) profiler->start_stage("SIQS (Квадратичное решето)");
         auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
@@ -900,32 +904,38 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7. GNFS — только в реальной рабочей полосе этой реализации (128-150 бит).
-    //    Числа крупнее оценка достижимости в gnfs.hpp отвергает, а построение
-    //    факторных баз стоило бы 5-54 с впустую, поэтому их сразу отправляем
-    //    в SIQS. При отказе GNFS (пограничные 145-150 бит) — тоже фолбэк на SIQS.
-    if (n.bit_width() >= kGnfsMinBits && n.bit_width() <= kGnfsMaxBits
-        && !::u128::Globals::LoadStop()) {
+    // 7-9. Решета. Порядок: SIQS — автоматический основной метод (до 320 бит),
+    //      GNFS — только по ручному запросу и в своей полосе 128-150 бит.
+    //      Замер на 136-битном полупростом: GNFS не укладывался и в 525 с
+    //      (запуск остановлен пользователем), тогда как SIQS справляется за
+    //      секунды — поэтому автоматический конвейер GNFS не выбирает.
+    auto try_gnfs = [&]() -> bool {
         if (status_cb)
             status_cb("Запуск GNFS (Общее решето числового поля)...");
         if (profiler)
             profiler->start_stage("GNFS (Решето числового поля)");
 
         auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb);
-        if (gnfs_res.has_value()) {
-            T f = *gnfs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
-            factors.insert(factors.end(), sub1.begin(), sub1.end());
-            factors.insert(factors.end(), sub2.begin(), sub2.end());
-            return factors;
-        }
-    }
+        if (!gnfs_res.has_value())
+            return false;
 
-    // 8. SIQS — основной метод для 200-320 бит и фолбэк после отказа GNFS.
-    //    (Раньше он был закрыт воротами "< 320 бит" и на 320-битных числах
-    //    не запускался вовсе: конвейер пытался в GNFS, тратил 40-60 с на его
-    //    настройку, получал отказ и возвращал число без разложения.)
+        T f = *gnfs_res;
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+        factors.insert(factors.end(), sub1.begin(), sub1.end());
+        factors.insert(factors.end(), sub2.begin(), sub2.end());
+        return true;
+    };
+
+    // 7. GNFS по ручному запросу — до SIQS (пользователь хочет именно его).
+    if (gnfs_preferred && in_gnfs_band && !::u128::Globals::LoadStop() && try_gnfs())
+        return factors;
+    if (gnfs_preferred && !in_gnfs_band && status_cb)
+        status_cb("GNFS недоступен: число вне полосы 128-150 бит — работаю через SIQS...");
+
+    // 8. SIQS — основной метод для всех чисел до 320 бит (GNFS при отказе
+    //    вернётся ниже фолбэком). Числа крупнее оценка достижимости в gnfs.hpp
+    //    отвергает, а построение факторных баз стоило бы 5-54 с впустую.
     if (n.bit_width() <= kSiqsMaxBits && !::u128::Globals::LoadStop()) {
         if (status_cb)
             status_cb("Запуск SIQS (факторизация через решето)...");
@@ -941,6 +951,11 @@ std::vector<T> factor_parallel_generic(T n,
             return factors;
         }
     }
+
+    // 9. GNFS фолбэк в полосе 128-150 бит — только если SIQS отказал
+    //    (в ручном режиме GNFS уже пробовался выше).
+    if (!gnfs_preferred && in_gnfs_band && !::u128::Globals::LoadStop() && try_gnfs())
+        return factors;
 
     if (profiler) profiler->finish();
     factors.push_back(n);

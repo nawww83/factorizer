@@ -190,6 +190,7 @@ FactorizerBackend::FactorizerBackend(QObject *parent)
     QSettings s;
     m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
     m_skipEcm = s.value("Algorithms/skipEcm", false).toBool(); // по умолчанию false
+    m_gnfsPreferred = s.value("Algorithms/gnfsPreferred", false).toBool(); // по умолчанию false
 }
 
 FactorizerBackend::~FactorizerBackend() {
@@ -218,6 +219,16 @@ void FactorizerBackend::setSkipEcm(bool val)
         QSettings s;
         s.setValue("Algorithms/skipEcm", val);
         emit skipEcmChanged();
+    }
+}
+
+void FactorizerBackend::setGnfsPreferred(bool val)
+{
+    if (m_gnfsPreferred != val) {
+        m_gnfsPreferred = val;
+        QSettings s;
+        s.setValue("Algorithms/gnfsPreferred", val);
+        emit gnfsPreferredChanged();
     }
 }
 
@@ -343,6 +354,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     setResult("");
 
     const bool skipEcm = m_skipEcm;
+    const bool gnfsPreferred = m_gnfsPreferred;
     setStatus(QString("Выполняется факторизация (%1 бит)%2...")
                   .arg(val.bitLength)
                   .arg(skipEcm ? ", ECM пропущен" : ""));
@@ -353,7 +365,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     std::string stdStr = numberStr.trimmed().toStdString();
     const int numberBits = static_cast<int>(val.bitLength);
 
-    std::thread([this, stdStr, numberBits, skipEcm]() {
+    std::thread([this, stdStr, numberBits, skipEcm, gnfsPreferred]() {
         using namespace bignum::generic_ecm;
         QElapsedTimer timer;
         timer.start();
@@ -417,7 +429,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             auto run = [&](auto tag) {
                 using T = typename decltype(tag)::type;
                 T val = T::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, gnfsPreferred);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
