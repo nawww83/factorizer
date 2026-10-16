@@ -2,6 +2,8 @@
 
 #include "u128.hpp"
 #include "u128_intrinsics.hpp"
+#include <bit>
+#include <cstdint>
 #include <string>
 #include <iostream>
 #include <type_traits>
@@ -17,6 +19,22 @@ public:
     using value_type = Half;
     using half_type  = Half;
     static constexpr uint32_t BITS = Half::BITS * 2;
+
+    // Разрядность лимба для быстрого деления (алгоритм D Кнута): 64 бита там,
+    // где есть 128-битные целые (GCC/Clang), иначе 32 бита (MSVC).
+#if defined(__SIZEOF_INT128__)
+    using limb_t = uint64_t;
+    using wide_t = unsigned __int128; // двойной лимб
+    using swide_t = __int128;         // знаковый двойной лимб
+#else
+    using limb_t = uint32_t;
+    using wide_t = uint64_t;
+    using swide_t = int64_t;
+#endif
+    static constexpr uint32_t LIMB_BITS = static_cast<uint32_t>(sizeof(limb_t) * 8);
+    static constexpr uint32_t LIMBS = BITS / LIMB_BITS;
+    static constexpr uint32_t HALF_LIMBS = Half::BITS / LIMB_BITS;
+    static constexpr bool FLAT = (BITS % LIMB_BITS == 0) && (Half::BITS % LIMB_BITS == 0);
 
     constexpr UBig() : m_hi(Half(0)), m_lo(Half(0)) {}
     constexpr UBig(uint64_t val) : m_hi(Half(0)), m_lo(Half(val)) {}
@@ -229,7 +247,59 @@ public:
             return UBig(q_half);
         }
 
-        // 3. Быстрое побитовое деление
+        // 3. Быстрый путь: длинное деление (алгоритм D Кнута) "широкого" числа
+        // на "половинку" (den.high() == 0). Это горячий путь mult_mod/square_mod.
+        if constexpr (FLAT)
+        {
+            if (den.high() == Half(0))
+            {
+                limb_t u[LIMBS] = {};
+                limb_t v[HALF_LIMBS] = {};
+                limb_t q_limbs[LIMBS] = {};
+                limb_t r_limbs[HALF_LIMBS] = {};
+
+                UBig tmp = num;
+                for (uint32_t i = 0; i < LIMBS; ++i)
+                {
+                    u[i] = static_cast<limb_t>(tmp.to_u64());
+                    tmp >>= LIMB_BITS;
+                }
+                UBig dtmp = den;
+                for (uint32_t i = 0; i < HALF_LIMBS; ++i)
+                {
+                    v[i] = static_cast<limb_t>(dtmp.to_u64());
+                    dtmp >>= LIMB_BITS;
+                }
+
+                // divmnu требует v[n-1] != 0 — отбрасываем незначащие старшие лимбы делителя.
+                int n = static_cast<int>(HALF_LIMBS);
+                while (n > 1 && v[n - 1] == 0)
+                    --n;
+
+                divmnu(q_limbs, r_limbs, u, v, static_cast<int>(LIMBS), n);
+
+                if constexpr (need_r)
+                {
+                    if (rem_out)
+                    {
+                        UBig R(0);
+                        for (uint32_t i = 0; i < HALF_LIMBS; ++i)
+                            R |= UBig(r_limbs[i]) << (LIMB_BITS * i);
+                        *rem_out = R;
+                    }
+                }
+                if constexpr (need_q)
+                {
+                    UBig Q(0);
+                    for (uint32_t i = 0; i < LIMBS; ++i)
+                        Q |= UBig(q_limbs[i]) << (LIMB_BITS * i);
+                    return Q;
+                }
+                return UBig(0);
+            }
+        }
+
+        // 4. Резервное побитовое деление (для делителя шире одной "половинки")
         uint32_t shift = num.bit_width() - den.bit_width();
         UBig current_den = den << shift;
         UBig rem = num;
@@ -257,6 +327,95 @@ public:
                 *rem_out = rem;
         }
         return q;
+    }
+
+    // --- Алгоритм D Кнута: деление "широкого" числа на "половинку" ---
+
+    /**
+     * @brief Длинное деление (алгоритм D Кнута) в системе счисления 2^LIMB_BITS.
+     * @details Делит u (m лимбов) на v (n лимбов). v[n-1] != 0, n >= 1.
+     *          u изменяется на месте. q получает m-n+1 лимбов (остальные
+     *          должны быть предварительно обнулены), r — n лимбов.
+     *          Разрядность лимба (64 или 32 бита) выбирается на этапе
+     *          компиляции — так код работает и на MSVC без __int128.
+     */
+    static void divmnu(limb_t *q, limb_t *r, limb_t *u,
+                       const limb_t *v, int m, int n) noexcept
+    {
+        // Делитель из одного лимба — простой проход.
+        if (n == 1)
+        {
+            limb_t k = 0;
+            for (int j = m - 1; j >= 0; --j)
+            {
+                wide_t cur = (static_cast<wide_t>(k) << LIMB_BITS) | u[j];
+                q[j] = static_cast<limb_t>(cur / v[0]);
+                k = static_cast<limb_t>(cur % v[0]);
+            }
+            r[0] = k;
+            return;
+        }
+
+        constexpr wide_t B = static_cast<wide_t>(1) << LIMB_BITS;
+        const int s = static_cast<int>(std::countl_zero(v[n - 1]));
+
+        // Нормализация: сдвигаем делитель так, чтобы старший бит старшего лимба был установлен.
+        limb_t vn[LIMBS];
+        for (int i = n - 1; i > 0; --i)
+            vn[i] = (v[i] << s) | (s ? (v[i - 1] >> (LIMB_BITS - s)) : 0);
+        vn[0] = static_cast<limb_t>(v[0] << s);
+
+        limb_t un[LIMBS + 1];
+        un[m] = s ? (u[m - 1] >> (LIMB_BITS - s)) : 0;
+        for (int i = m - 1; i > 0; --i)
+            un[i] = (u[i] << s) | (s ? (u[i - 1] >> (LIMB_BITS - s)) : 0);
+        un[0] = static_cast<limb_t>(u[0] << s);
+
+        for (int j = m - n; j >= 0; --j)
+        {
+            // Оценка очередного лимба частного с коррекцией.
+            wide_t num = (static_cast<wide_t>(un[j + n]) << LIMB_BITS) | un[j + n - 1];
+            wide_t qhat = num / vn[n - 1];
+            wide_t rhat = num % vn[n - 1];
+            while (qhat >= B || qhat * vn[n - 2] > ((rhat << LIMB_BITS) | un[j + n - 2]))
+            {
+                --qhat;
+                rhat += vn[n - 1];
+                if (rhat >= B)
+                    break;
+            }
+
+            // Умножение и вычитание: un[j .. j+n] -= qhat * vn
+            swide_t k = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                wide_t p = qhat * vn[i];
+                swide_t t = static_cast<swide_t>(un[i + j]) - k - static_cast<swide_t>(static_cast<limb_t>(p));
+                un[i + j] = static_cast<limb_t>(t);
+                k = static_cast<swide_t>(p >> LIMB_BITS) - (t >> LIMB_BITS);
+            }
+            swide_t t2 = static_cast<swide_t>(un[j + n]) - k;
+            un[j + n] = static_cast<limb_t>(t2);
+            q[j] = static_cast<limb_t>(qhat);
+
+            if (t2 < 0)
+            {
+                // Оценка была на единицу больше — прибавляем делитель обратно.
+                q[j] -= 1;
+                limb_t carry = 0;
+                for (int i = 0; i < n; ++i)
+                {
+                    wide_t ss = static_cast<wide_t>(un[i + j]) + vn[i] + carry;
+                    un[i + j] = static_cast<limb_t>(ss);
+                    carry = static_cast<limb_t>(ss >> LIMB_BITS);
+                }
+                un[j + n] = static_cast<limb_t>(un[j + n] + carry);
+            }
+        }
+
+        // Денормализация остатка.
+        for (int i = 0; i < n; ++i)
+            r[i] = (un[i] >> s) | (s ? (un[i + 1] << (LIMB_BITS - s)) : 0);
     }
 
     struct DivResult;
