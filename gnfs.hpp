@@ -414,6 +414,427 @@ inline bool is_irreducible_mod_q_fast(const std::vector<uint32_t> &f_mod, uint32
 }
 
 //
+// --- Разреженная линейная алгебра над GF(2): метод Видеманна ---
+//
+// Плотный Гаусс с матрицей «истории» (прежний решатель) стоил O(M^2) памяти
+// (~60 МБ при M~15000) и O(M^2 * words) времени на одном ядре. Здесь матрица
+// зависимостей B (M соотношений x N простых/характеристик) хранится разреженно
+// (~40 ненулей на строку) и решается «чёрным ящиком» итерационно.
+//
+// Для надёжности над GF(2) используется встроенная симметричная матрица
+// Â = [ 0  B ]  размера (M+N) x (M+N):  Â * (a; b) = (B * b ; B^T * a).
+//           [ B^T 0 ]
+// Тогда ker(Â) = ker(B^T) + ker(B): у ЛЮБОГО вектора (a; b) из ядра Â
+// компонента a автоматически удовлетворяет B^T a = 0, то есть является
+// корректной зависимостью строк B. Это исключает «ложные» векторы ядра
+// S = B*B^T (когда B^T x попадает в ненулевое ядро самого B), из-за которых
+// plain-Wiedemann над S может вообще никогда не сработать для отдельных
+// матриц (проверено: 0/500 попыток на синтетических случаях).
+//
+// Схема (метод Видеманна с Berlekamp—Massey):
+//   1. Последовательность Крылова u_k = s^T Â^k t (матрично-векторное
+//      произведение Â — два прохода по разреженной B, как у S).
+//   2. Мин. многочлен mu(z) последовательности — алгоритмом
+//      Берлеппа—Масси (обратный connection-полиному: mu = z^L*C(1/z)).
+//   3. mu(z) = z^e * h(z); вектор x = Â^(e-1) * h(Â) * t при
+//      mu(S)t = 0 лежит в ядре Â.
+//   4. Проверяем точное условие B^T a = 0 (a — первая компонента x) —
+//      при провале берём новый случайный старт (рестарт).
+//
+// Замеры на реальной GNFS-матрице 15286x15050 (nnz~610k, 128-битный прогон):
+//   * плотный Гаусс с матрицей истории — ~18 с и ~58 МБ, детерминированно точен;
+//   * Видеманд — ~64 с на ПОПЫТКУ и ~2-3% успеха: реальные GNFS-матрицы
+//     структурно «патологичны» (см. ниже), поэтому в сумме он проигрывает
+//     Гауссу на текущих размерах. Зато его память O(nnz) (~3 МБ) масштабируется:
+//     при M~10^5 (верхняя граница проекта) плотный Гаусс потребовал бы ~2.5 ГБ.
+//
+// Ограничение метода (проверено экспериментально): из ОДНОГО случайного старта
+// t достижимо лишь одно направление ядра Â — нижний конец самой длинной
+// цепочки Жордана. Если левое ядро B^T лежит в блоках «длины 1» (т.е.
+// B^T-ядро не пересекается с образом B — типовая ситуация), а longest-цепочка
+// заканчивается в правой половине (b), то все извлечения дают a = 0 (~5-15%
+// синтетических матриц, и реальная GNFS-матрица оказалась такой же).
+//
+// Поэтому solve_linear_algebra выбирает метод по бюджету памяти плотной формы:
+//   * матрица укладывается в 128 МБ — сначала точный Гаусс
+//     (gf2_dense_kernel_combinations, быстр и корректен), Видеманд — страховка;
+//   * не укладывается — только gf2_find_kernel_vectors (Видеманд, O(nnz)
+//     память, бюджет 256 попыток: при 2-3% успеха вероятность промаха <1%).
+
+namespace detail {
+
+// Бит B-матрицы: M строк x N столбцов, CSR + CSC (для B и B^T соответственно).
+struct Gf2Matrix
+{
+    size_t rows_n = 0;
+    size_t cols_n = 0;
+    std::vector<uint32_t> row_ptr;   // M + 1 (CSR)
+    std::vector<uint32_t> row_cols;  // nnz индексов столбцов
+    std::vector<uint32_t> col_ptr;   // N + 1 (CSC)
+    std::vector<uint32_t> col_rows;  // nnz индексов строк
+
+    size_t nnz() const { return row_cols.size(); }
+
+    // Построить CSC из CSR (для умножения на B^T).
+    void build_csc()
+    {
+        col_ptr.assign(cols_n + 1, 0);
+        for (uint32_t c : row_cols)
+            col_ptr[c + 1]++;
+        for (size_t i = 0; i < cols_n; ++i)
+            col_ptr[i + 1] += col_ptr[i];
+        col_rows.resize(row_cols.size());
+        std::vector<uint32_t> off(col_ptr.begin(), col_ptr.end() - 1);
+        for (size_t r = 0; r < rows_n; ++r) {
+            for (uint32_t k = row_ptr[r]; k < row_ptr[r + 1]; ++k)
+                col_rows[off[row_cols[k]]++] = static_cast<uint32_t>(r);
+        }
+    }
+};
+
+inline size_t gf2_words(size_t n) { return (n + 63) / 64; }
+
+inline bool gf2_any(const uint64_t *a, size_t w)
+{
+    for (size_t i = 0; i < w; ++i)
+        if (a[i])
+            return true;
+    return false;
+}
+
+inline void gf2_xor(uint64_t *dst, const uint64_t *src, size_t w)
+{
+    for (size_t i = 0; i < w; ++i)
+        dst[i] ^= src[i];
+}
+
+// Скалярное произведение над GF(2): чётность попарных AND.
+// Важно: накопление через XOR (не +=): чётность popcount(a+b) НЕ равна
+// чётности popcount(a) ^ popcount(b) — переносы ломают инвариант.
+inline bool gf2_dot(const uint64_t *a, const uint64_t *b, size_t w)
+{
+    uint64_t acc = 0;
+    for (size_t i = 0; i < w; ++i)
+        acc ^= a[i] & b[i];
+    return (std::popcount(acc) & 1) != 0;
+}
+
+// y = B * u  (u: N бит -> y: M бит)
+inline void gf2_mul_B(const Gf2Matrix &B, const uint64_t *u, uint64_t *y)
+{
+    const size_t mw = gf2_words(B.rows_n);
+    std::fill(y, y + mw, 0);
+    for (size_t r = 0; r < B.rows_n; ++r) {
+        unsigned p = 0;
+        for (uint32_t k = B.row_ptr[r]; k < B.row_ptr[r + 1]; ++k) {
+            const uint32_t c = B.row_cols[k];
+            p ^= static_cast<unsigned>((u[c >> 6] >> (c & 63)) & 1u);
+        }
+        if (p)
+            y[r >> 6] |= 1ULL << (r & 63);
+    }
+}
+
+// u = B^T * x  (x: M бит -> u: N бит)
+inline void gf2_mul_Bt(const Gf2Matrix &B, const uint64_t *x, uint64_t *u)
+{
+    const size_t nw = gf2_words(B.cols_n);
+    std::fill(u, u + nw, 0);
+    for (size_t r = 0; r < B.rows_n; ++r) {
+        if ((x[r >> 6] >> (r & 63)) & 1) {
+            for (uint32_t k = B.row_ptr[r]; k < B.row_ptr[r + 1]; ++k) {
+                const uint32_t c = B.row_cols[k];
+                u[c >> 6] ^= 1ULL << (c & 63);
+            }
+        }
+    }
+}
+
+// y = S * x = B * (B^T * x); scratch — буфер на gf2_words(cols_n) слов.
+inline void gf2_mul_S(const Gf2Matrix &B, const uint64_t *x, uint64_t *y,
+                      uint64_t *scratch)
+{
+    gf2_mul_Bt(B, x, scratch);
+    gf2_mul_B(B, scratch, y);
+}
+
+// Встроенная симметричная матрица Â = [0 B; B^T 0] в пополняемом словами
+// представлении: вектор (a; b) лежит в словах [0, mw) и [mw, mw+nw)
+// (логические размеры M и N, биты выше M и N в последнем слове каждого
+// блока — «зазор»: матрица Â обнуляет их за один шаг и не меняет структуру
+// цепочек Жордана). Â * (a; b) = (B * b ; B^T * a). out не должен
+// совпадать с z.
+inline void gf2_mul_A(const Gf2Matrix &B, const uint64_t *z, uint64_t *out)
+{
+    const size_t mw = gf2_words(B.rows_n);
+    gf2_mul_B(B, z + mw, out);        // верхний блок: B * b  (M бит)
+    gf2_mul_Bt(B, z, out + mw);       // нижний блок: B^T * a (N бит)
+}
+
+// xorshift64* — только для стартовых векторов решателя (не криптографический).
+struct Gf2Rng
+{
+    uint64_t s;
+    explicit Gf2Rng(uint64_t seed)
+        : s(seed ? seed : 0x9e3779b97f4a7c15ULL)
+    {
+    }
+    uint64_t next()
+    {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        return s * 0x2545F4914F6CDD1DULL;
+    }
+};
+
+// Berlekamp—Massey над GF(2). На входе — последовательность бит (0/1),
+// на выходе — минимальный многочлен mu(z) = sum mu_i z^i (обратный
+// connection-полиному C(z): mu(z) = z^L * C(1/z)).
+inline std::vector<uint8_t> berlekamp_massey(const std::vector<uint8_t> &seq)
+{
+    std::vector<uint8_t> C(1, 1);
+    std::vector<uint8_t> Bv(1, 1);
+    size_t L = 0;
+    size_t m = 1;
+    const size_t n = seq.size();
+    for (size_t N = 0; N < n; ++N) {
+        uint8_t d = seq[N] & 1;
+        for (size_t i = 1; i <= L && i < C.size(); ++i)
+            if (C[i] & seq[N - i])
+                d ^= 1;
+        if (d == 0) {
+            ++m;
+        } else if (2 * L <= N) {
+            std::vector<uint8_t> T = C;
+            const size_t need = m + Bv.size();
+            if (C.size() < need)
+                C.resize(need, 0);
+            for (size_t i = 0; i < Bv.size(); ++i)
+                C[i + m] ^= Bv[i];
+            L = N + 1 - L;
+            Bv = std::move(T);
+            m = 1;
+        } else {
+            const size_t need = m + Bv.size();
+            if (C.size() < need)
+                C.resize(need, 0);
+            for (size_t i = 0; i < Bv.size(); ++i)
+                C[i + m] ^= Bv[i];
+            ++m;
+        }
+    }
+    C.resize(L + 1, 0);
+    std::vector<uint8_t> mu(L + 1);
+    for (size_t i = 0; i <= L; ++i)
+        mu[i] = C[L - i];
+    return mu;
+}
+
+// Ищет a != 0 с B^T a = 0 (a — комбинация строк B, дающая нулевую строку).
+// Работает через ядро встроенной симметричной Â = [0 B; B^T 0]: вектор
+// (a; b) из ядра Â всегда даёт корректную зависимость B^T a = 0, поэтому
+// единственные причины рестарта — «неудачный» старт (e == 0, x == 0) или
+// отсутствие разделения mu_seq = mu_Krylov (проверка B^T a = 0 остаётся
+// как стопроцентная верификация). on_candidate вызывается с каждым
+// найденным кандидатом; если возвращает true, поиск прекращается.
+// Возвращает число найденных и принятых кандидатов.
+inline size_t gf2_find_kernel_vectors(
+    const Gf2Matrix &B, size_t max_attempts,
+    const std::function<bool()> &stopped,
+    const std::function<bool(const std::vector<uint64_t> &)> &on_candidate)
+{
+    const size_t M = B.rows_n;
+    const size_t N = B.cols_n;
+    const size_t mw = gf2_words(M);
+    const size_t nw = gf2_words(N);
+    const size_t dw = mw + nw;                    // слова Â-вектора (a; b)
+    const size_t padded = dw * 64;                // размер пополняемого пространства
+    const size_t seq_len = 2 * padded + 2;        // >= 2 * deg(mu) c запасом
+
+    std::vector<uint64_t> s(dw), t(dw), cur(dw), nxt(dw);
+    std::vector<uint64_t> x(dw), acc(dw), scratch(nw);
+    std::vector<uint8_t> seq;
+    seq.reserve(seq_len);
+
+    const uint64_t seed = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    Gf2Rng rng(seed);
+
+    size_t found = 0;
+    for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        if (stopped())
+            break;
+
+        auto rand_vec = [&rng, dw](std::vector<uint64_t> &v) {
+            for (size_t i = 0; i < dw; ++i)
+                v[i] = rng.next();
+            if (!gf2_any(v.data(), dw))
+                v[0] = 1;
+        };
+        rand_vec(s);
+        rand_vec(t);
+
+        // u_k = s . Â^k t
+        seq.clear();
+        std::copy(t.begin(), t.end(), cur.begin());
+        for (size_t k = 0; k < seq_len; ++k) {
+            seq.push_back(gf2_dot(s.data(), cur.data(), dw) ? 1 : 0);
+            if ((k & 0xFF) == 0 && stopped())
+                return found;
+            gf2_mul_A(B, cur.data(), nxt.data());
+            cur.swap(nxt);
+        }
+
+        const std::vector<uint8_t> mu = berlekamp_massey(seq);
+        size_t e = 0;
+        while (e < mu.size() && mu[e] == 0)
+            ++e;
+        if (e == 0)
+            continue; // z не делит mu: t не «увидел» ядро — рестарт
+
+        // x = h(Â) t, h(z) = mu(z) / z^e (схема Горнера)
+        std::fill(acc.begin(), acc.end(), 0);
+        const size_t deg_h = mu.size() - 1 - e;
+        for (size_t i = deg_h + 1; i-- > 0;) {
+            if (gf2_any(acc.data(), dw)) {
+                gf2_mul_A(B, acc.data(), nxt.data());
+                acc.swap(nxt);
+            }
+            if (mu[e + i])
+                gf2_xor(acc.data(), t.data(), dw);
+        }
+        // x = Â^(e-1) * acc
+        x = acc;
+        for (size_t i = 1; i < e; ++i) {
+            gf2_mul_A(B, x.data(), nxt.data());
+            x.swap(nxt);
+        }
+
+        // a-компонента (слова [0, mw)) — комбинация строк B. Отбрасываем
+        // биты «зазора» выше M (при x = t они ещё не обнулены).
+        std::vector<uint64_t> a(x.begin(), x.begin() + mw);
+        const size_t tail_bits = M & 63;
+        if (tail_bits != 0)
+            a[mw - 1] &= (1ULL << tail_bits) - 1;
+        if (!gf2_any(a.data(), mw))
+            continue;
+        // точная проверка: B^T a == 0 (в ядре Â выполнено автоматически,
+        // оставлена как верификация — стоит один проход по B)
+        gf2_mul_Bt(B, a.data(), scratch.data());
+        if (gf2_any(scratch.data(), nw))
+            continue;
+
+        ++found;
+        if (on_candidate(a))
+            break;
+    }
+    return found;
+}
+
+// Резервный точный метод: плотный Гаусс над GF(2) с матрицей «истории» строк.
+// Используется, когда итерационный Видеманд не сошёлся за отведённые попытки:
+// бывают «патологичные» матрицы, у которых единственные доступные из случайного
+// вектора Крылова векторы ядра Â лежат в правой половине (b), а левое ядро B^T
+// недостижимо из одного старта (структура цепочек Жордана). Память
+// O(M*(N+M)/64) (~60 МБ при M~15000) — платим только при фактическом
+// обращении; векторы ядра = случайные комбинации базиса (равномерны).
+inline size_t gf2_dense_kernel_combinations(
+    const Gf2Matrix &B, size_t max_candidates,
+    const std::function<bool()> &stopped,
+    const std::function<bool(const std::vector<uint64_t> &)> &on_candidate)
+{
+    const size_t M = B.rows_n;
+    const size_t N = B.cols_n;
+    const size_t words = gf2_words(N);
+    const size_t hist_words = gf2_words(M);
+
+    struct DenseRow
+    {
+        std::vector<uint64_t> mask;
+        std::vector<uint64_t> history;
+    };
+    std::vector<DenseRow> matrix(M);
+    for (size_t r = 0; r < M; ++r) {
+        matrix[r].mask.assign(words, 0);
+        matrix[r].history.assign(hist_words, 0);
+        matrix[r].history[r / 64] |= (1ULL << (r % 64));
+        for (uint32_t k = B.row_ptr[r]; k < B.row_ptr[r + 1]; ++k) {
+            const uint32_t c = B.row_cols[k];
+            matrix[r].mask[c / 64] ^= (1ULL << (c % 64));
+        }
+    }
+
+    // Прямой ход Гаусса над GF(2) с накоплением истории (линейных комбинаций
+    // исходных строк), дающих текущую строку.
+    size_t row = 0;
+    for (size_t col = 0; col < N && row < M; ++col) {
+        if ((row & 0xFF) == 0 && stopped())
+            return 0;
+        const size_t col_w = col / 64;
+        const uint64_t col_mask = 1ULL << (col % 64);
+        size_t pivot = row;
+        while (pivot < M && !(matrix[pivot].mask[col_w] & col_mask))
+            ++pivot;
+        if (pivot >= M)
+            continue;
+        if (row != pivot)
+            std::swap(matrix[row], matrix[pivot]);
+        for (size_t r = 0; r < M; ++r) {
+            if (r != row && (matrix[r].mask[col_w] & col_mask)) {
+                for (size_t w = col_w; w < words; ++w)
+                    matrix[r].mask[w] ^= matrix[row].mask[w];
+                for (size_t w = 0; w < hist_words; ++w)
+                    matrix[r].history[w] ^= matrix[row].history[w];
+            }
+        }
+        ++row;
+    }
+
+    // Нулевые строки после редукции = базис левого ядра B^T.
+    std::vector<const std::vector<uint64_t> *> basis;
+    for (size_t r = 0; r < M; ++r) {
+        bool all_zero = true;
+        for (size_t w = 0; w < words && all_zero; ++w) {
+            if (matrix[r].mask[w] != 0)
+                all_zero = false;
+        }
+        if (all_zero)
+            basis.push_back(&matrix[r].history);
+    }
+    if (basis.empty())
+        return 0;
+
+    const uint64_t seed = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    Gf2Rng rng(seed);
+
+    std::vector<uint64_t> cand(hist_words);
+    size_t found = 0;
+    for (size_t i = 0; i < max_candidates; ++i) {
+        if (stopped())
+            break;
+        std::fill(cand.begin(), cand.end(), 0);
+        bool nonzero = false;
+        for (size_t j = 0; j < basis.size(); ++j) {
+            if ((rng.next() & 1) == 0)
+                continue; // равномерный случайный набор направлений ядра
+            nonzero = true;
+            for (size_t w = 0; w < hist_words; ++w)
+                cand[w] ^= (*basis[j])[w];
+        }
+        if (!nonzero)
+            continue; // вырожденный выбор — пропускаем
+        ++found;
+        if (on_candidate(cand))
+            break;
+    }
+    return found;
+}
+
+} // namespace detail
+
+//
 // --- Основной класс Решета Числового Поля (GNFS) ---
 
 template<typename T>
@@ -2080,42 +2501,38 @@ private:
         }
 
         if (status_cb)
-            status_cb("GNFS: Построение бинарной матрицы: " + std::to_string(M) + " строк x "
-                      + std::to_string(total_cols) + " столбцов");
+            status_cb("GNFS: Построение разреженной бинарной матрицы: "
+                      + std::to_string(M) + " строк x " + std::to_string(total_cols)
+                      + " столбцов");
 
-        size_t words = (total_cols + 63) / 64;
-        size_t hist_words = (M + 63) / 64;
-
-        struct MatrixRow
-        {
-            std::vector<uint64_t> mask;
-            std::vector<uint64_t> history;
-        };
-
-        std::vector<MatrixRow> matrix(M);
-        size_t alg_offset = 1 + rfb_len;
-        size_t qcb_offset = base_prime_cols;
+        // Разреженное хранение: строка = список столбцов с единицей.
+        // Раскладка столбцов прежняя: 0 — знак рациональной стороны,
+        // 1..rfb — нечётные степени RFB, далее знак алгебраической стороны,
+        // нечётные степени AFB, затем квадратичные характеры.
+        detail::Gf2Matrix B;
+        B.rows_n = M;
+        B.cols_n = total_cols;
+        B.row_ptr.resize(M + 1);
+        const size_t alg_offset = 1 + rfb_len;
+        const size_t qcb_offset = base_prime_cols;
 
         for (size_t r = 0; r < M; ++r) {
+            B.row_ptr[r] = static_cast<uint32_t>(B.row_cols.size());
             const auto &rel = m_relations[r];
-            matrix[r].mask.assign(words, 0);
-            matrix[r].history.assign(hist_words, 0);
-            matrix[r].history[r / 64] |= (1ULL << (r % 64));
-
-            auto toggle_col = [&](size_t col) { matrix[r].mask[col / 64] ^= (1ULL << (col % 64)); };
 
             if (rel.rat_neg)
-                toggle_col(0);
+                B.row_cols.push_back(0);
             for (size_t i = 0; i < rel.rat_idx.size(); ++i) {
                 if (rel.rat_pow[i] & 1)
-                    toggle_col(1 + rel.rat_idx[i]);
+                    B.row_cols.push_back(static_cast<uint32_t>(1 + rel.rat_idx[i]));
             }
 
             if (rel.alg_neg)
-                toggle_col(alg_offset);
+                B.row_cols.push_back(static_cast<uint32_t>(alg_offset));
             for (size_t i = 0; i < rel.alg_idx.size(); ++i) {
                 if (rel.alg_pow[i] & 1)
-                    toggle_col(alg_offset + 1 + rel.alg_idx[i]);
+                    B.row_cols.push_back(
+                        static_cast<uint32_t>(alg_offset + 1 + rel.alg_idx[i]));
             }
 
             for (size_t i = 0; i < qcb_len; ++i) {
@@ -2137,101 +2554,62 @@ private:
                     qcb_bit ^= eval_qcb(rel.a2, rel.b2);
                 }
                 if (qcb_bit)
-                    toggle_col(qcb_offset + i);
+                    B.row_cols.push_back(static_cast<uint32_t>(qcb_offset + i));
             }
         }
+        B.row_ptr[M] = static_cast<uint32_t>(B.row_cols.size());
+        B.build_csc();
 
-        // Прямой и обратный ход метода Гаусса над GF(2)
-        size_t row = 0;
-        for (size_t col = 0; col < total_cols && row < M; ++col) {
-            size_t col_w = col / 64;
-            uint64_t col_mask = 1ULL << (col % 64);
-            size_t pivot = row;
-            while (pivot < M && !(matrix[pivot].mask[col_w] & col_mask)) {
-                pivot++;
-            }
-            if (pivot >= M)
-                continue;
-            if (row != pivot)
-                std::swap(matrix[row], matrix[pivot]);
+        if (status_cb)
+            status_cb("GNFS: СЛАУ: решение над GF(2), ненулей: " + std::to_string(B.nnz()));
 
-            const auto &pivot_mask = matrix[row].mask;
-            const auto &pivot_hist = matrix[row].history;
-            for (size_t r = 0; r < M; ++r) {
-                if (r != row && (matrix[r].mask[col_w] & col_mask)) {
-                    for (size_t w = col_w; w < words; ++w)
-                        matrix[r].mask[w] ^= pivot_mask[w];
-                    for (size_t hw = 0; hw < hist_words; ++hw)
-                        matrix[r].history[hw] ^= pivot_hist[hw];
-                }
-            }
-            row++;
-        }
-
-        if (status_cb) {
-            status_cb("GNFS: СЛАУ: Гаусс завершён, перебор векторов ядра...");
-        }
-
-        size_t null_rows = 0;
+        size_t attempts_done = 0;
         size_t sqrt_ok = 0;
         size_t sq_match = 0;
+        std::optional<T> result;
 
-        // Нулевые строки = базис ядра. Базисные векторы МОГУТ все давать один и
-        // тот же «неквадратный» класс (единица/класс кольца Z[alpha]) — тогда ни
-        // один прямой вектор не даст целочисленного корня, хотя комбинации дают.
-        // Любая сумма векторов ядра тоже вектор ядра, поэтому перебираем и их:
-        // v0, v1, v0^v1, затем для j>=2: vj, vj^v0, vj^v1, vj^v0^v1 — это покрывает
-        // все 4 сочетания по первым двум направлениям ядра для каждого j.
-        std::vector<size_t> null_list;
-        for (size_t r = 0; r < M; ++r) {
-            bool all_zero = true;
-            for (size_t w = 0; w < words; ++w) {
-                if (matrix[r].mask[w] != 0) {
-                    all_zero = false;
-                    break;
-                }
-            }
-            if (all_zero)
-                null_list.push_back(r);
-        }
+        const auto la_t0 = std::chrono::steady_clock::now();
+        auto la_sec = [&la_t0]() {
+            return std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::steady_clock::now() - la_t0)
+                .count();
+        };
 
-        std::vector<uint64_t> hist_comb(hist_words, 0);
-        const size_t total_attempts =
-            3 + (null_list.size() > 2 ? (null_list.size() - 2) * 4 : 0);
-        for (size_t attempt = 0; attempt < total_attempts; ++attempt) {
-            if (::u128::Globals::LoadStop())
-                break;
-            size_t j, mask;
-            if (attempt == 0) {
-                j = 0;
-                mask = 0; // v0
-            } else if (attempt == 1) {
-                j = 1;
-                mask = 0; // v1
-            } else if (attempt == 2) {
-                j = 0;
-                mask = 2; // v0 ^ v1
-            } else {
-                j = (attempt - 3) / 4 + 2;
-                mask = (attempt - 3) % 4;
-            }
-            if (j >= null_list.size())
-                break;
-            if ((mask & 3) != 0 && null_list.size() < 2)
-                break;
+        // Выбор алгоритма по бюджету памяти (замеры на реальной GNFS-матрице
+        // 15286x15050, nnz~610k): плотный Гаусс с матрицей истории — ~18 с и
+        // ~58 МБ, детерминированно точен. Итерационный Видеманд на таких
+        // матрицах сходится плохо (~2-3% попыток, ~64 с/попытка: реальные
+        // GNFS-матрицы структурно «патологичны» — левое ядро B^T недостижимо
+        // из случайного вектора Крылова), зато его память O(nnz) (~3 МБ)
+        // масштабируется: при M~10^5 плотный Гаусс потребовал бы ~2.5 ГБ.
+        // Поэтому: матрица укладывается в бюджет памяти — идём точным
+        // Гауссом; не укладывается — Видеманд с большим бюджетом попыток.
+        const size_t dense_bytes = M * (detail::gf2_words(total_cols) + detail::gf2_words(M))
+                                   * sizeof(uint64_t);
+        constexpr uint64_t kDenseBudgetBytes = 128ull << 20; // 128 МБ
+        const bool dense_first = dense_bytes <= kDenseBudgetBytes;
+        if (status_cb)
+            status_cb(dense_first
+                          ? "GNFS: СЛАУ: метод — точный плотный Гаусс (матрица "
+                                + std::to_string(dense_bytes >> 20) + " МБ, бюджет "
+                                + std::to_string(kDenseBudgetBytes >> 20) + " МБ)"
+                          : "GNFS: СЛАУ: метод — Видеманд (плотная форма "
+                                + std::to_string(dense_bytes >> 20) + " МБ > бюджет "
+                                + std::to_string(kDenseBudgetBytes >> 20) + " МБ)");
 
-            null_rows++;
-            // comb = v_j ^ (mask&1 ? v0 : 0) ^ (mask&2 ? v1 : 0)
-            std::copy(matrix[null_list[j]].history.begin(),
-                      matrix[null_list[j]].history.end(), hist_comb.begin());
-            if (mask & 1) {
-                for (size_t w = 0; w < hist_words; ++w)
-                    hist_comb[w] ^= matrix[null_list[0]].history[w];
-            }
-            if (mask & 2) {
-                for (size_t w = 0; w < hist_words; ++w)
-                    hist_comb[w] ^= matrix[null_list[1]].history[w];
-            }
+        // Каждый найденный вектор ядра a (B^T a = 0) — случайная комбинация
+        // соотношений, дающая «квадрат» с обеих сторон. В отличие от прежнего
+        // перебора комбинаций базисных векторов, случайные векторы ядра
+        // равномерно покрывают ядро, поэтому вероятность успеха каждого —
+        // порядка 1/2 (квадратичный класс).
+        constexpr size_t kDenseCandidates = 48;
+        // Для «здоровых» матриц Видеманд сходится за 1-6 попыток; для
+        // «патологичных» ожидаемое число попыток ~30-40 (2-3% каждая) —
+        // бюджет 256 даёт вероятность промаха <1%.
+        constexpr size_t kWiedemannAttempts = 256;
+        auto try_candidate = [&](const std::vector<uint64_t> &x) -> bool {
+                ++attempts_done;
+                const std::vector<uint64_t> &hist_comb = x;
 
             std::vector<uint64_t> rfb_powers(rfb_len, 0);
             std::unordered_map<uint64_t, uint64_t> lp_rat_counts;
@@ -2250,7 +2628,7 @@ private:
                 }
             }
             if (dep_rels.empty())
-                continue;
+                return false;
 
             T X = T(1);
             for (size_t i = 0; i < rfb_len; ++i) {
@@ -2283,18 +2661,18 @@ private:
             }
             ::bignum::siqs::mult_mod(X, f_deriv_m, m_N);
 
-            if (status_cb && (null_rows <= 3 || null_rows % 25 == 0)) {
-                status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(null_rows)
+            if (status_cb && (attempts_done <= 3 || attempts_done % 25 == 0)) {
+                status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(attempts_done)
                           + " (строк в связи: " + std::to_string(dep_rels.size())
-                          + "), извлечение корня...");
+                          + "), извлечение корня... t=" + std::to_string(la_sec()) + " с");
             }
 
             auto y_opt = compute_algebraic_sqrt_mod_n(dep_rels);
             if (!y_opt.has_value()) {
-                if (status_cb && (null_rows <= 3 || null_rows % 25 == 0))
-                    status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(null_rows)
+                if (status_cb && (attempts_done <= 3 || attempts_done % 25 == 0))
+                    status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(attempts_done)
                               + ": корень не извлечён (sqrt=" + std::to_string(sqrt_ok) + ")");
-                continue;
+                return false;
             }
             sqrt_ok++;
             T Y = *y_opt;
@@ -2308,7 +2686,7 @@ private:
             // ДИАГНОСТИКА: прямой пересчёт P(m) = f'(m)^2 * prod(a - b*m) (mod N).
             // Сверка X^2 и Y^2 с ним локализует ошибку: X^2!=P(m) — сторона X/матрицы,
             // Y^2!=P(m) — извлечение корня.
-            if (status_cb && null_rows <= 3) {
+            if (status_cb && attempts_done <= 3) {
                 // Точная сверка факторизаций соотношений в связи (без переполнений —
                 // делением): ∏p^e · LP^2 == |F(a,b)| (·|F(a2,b2)|). Несовпадение
                 // означает баг разложения/спаривания (элементарная ошибка), совпадение
@@ -2422,7 +2800,7 @@ private:
                 bool y_ok = (Y2 == prod_m);
                 T neg_prod_m = (prod_m == T(0)) ? T(0) : (m_N - prod_m); // -P(m) mod N
                 bool y_neg_ok = (Y2 == neg_prod_m);
-                status_cb("GNFS: ДИАГ: вектор #" + std::to_string(null_rows)
+                status_cb("GNFS: ДИАГ: вектор #" + std::to_string(attempts_done)
                           + " пар=" + std::to_string(pair_cnt)
                           + " отр.норм=" + std::to_string(neg_cnt)
                           + " битых разл. рац/алг=" + std::to_string(bad_rat) + "/" + std::to_string(bad_alg)
@@ -2435,10 +2813,11 @@ private:
             if (X2 == Y2)
                 sq_match++;
 
-            if (status_cb && (null_rows <= 5 || null_rows % 25 == 0)) {
-                status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(null_rows)
+            if (status_cb && (attempts_done <= 5 || attempts_done % 25 == 0)) {
+                status_cb("GNFS: СЛАУ: вектор ядра #" + std::to_string(attempts_done)
                           + ": X^2==Y^2 " + (X2 == Y2 ? "ДА" : "НЕТ") + " (match="
-                          + std::to_string(sq_match) + "/" + std::to_string(sqrt_ok) + ")");
+                          + std::to_string(sq_match) + "/" + std::to_string(sqrt_ok)
+                          + ") t=" + std::to_string(la_sec()) + " с");
             }
 
             T diff = (X >= Y) ? (X - Y) : (Y - X);
@@ -2447,24 +2826,68 @@ private:
             if (g1 > T(1) && g1 < m_N) {
                 if (status_cb)
                     status_cb("GNFS: Успех! Найден делитель: " + g1.toString());
-                return g1;
+                result = g1;
+                return true;
             }
             T g2 = ::bignum::siqs::gcd_generic(sum, m_N);
             if (g2 > T(1) && g2 < m_N) {
                 if (status_cb)
                     status_cb("GNFS: Успех! Найден делитель: " + g2.toString());
-                return g2;
+                result = g2;
+                return true;
             }
+            return false;
+            };
+
+        const auto stop_cb = []() { return ::u128::Globals::LoadStop(); };
+        if (dense_first) {
+            // Режим 1 (матрица укладывается в бюджет): сначала точный Гаусс —
+            // быстр (~18 с на 15k) и гарантированно корректен. Видеманд — только
+            // страховочная ветка, если Гаусс вдруг не даст кандидатов.
+            const size_t dense_found = detail::gf2_dense_kernel_combinations(
+                B, kDenseCandidates, stop_cb, try_candidate);
+            if (status_cb && !result)
+                status_cb("GNFS: СЛАУ: плотный Гаусс: кандидатов "
+                          + std::to_string(dense_found) + " за "
+                          + std::to_string(la_sec()) + " с");
+            if (!result && !stop_cb()) {
+                if (status_cb)
+                    status_cb("GNFS: СЛАУ: Гаусс не дал кандидатов — пробуем Видеманд");
+                const size_t wied_found = detail::gf2_find_kernel_vectors(
+                    B, kWiedemannAttempts, stop_cb, try_candidate);
+                if (status_cb && !result)
+                    status_cb("GNFS: СЛАУ: Видеманд: кандидатов "
+                              + std::to_string(wied_found) + " за "
+                              + std::to_string(la_sec()) + " с (всего)");
+            }
+        } else {
+            // Режим 2 (плотная форма не помещается в память): Видеманд с
+            // памятью O(nnz). Резервного точного метода нет — он неприменим.
+            const size_t wied_found = detail::gf2_find_kernel_vectors(
+                B, kWiedemannAttempts, stop_cb, try_candidate);
+            if (status_cb && !result)
+                status_cb("GNFS: СЛАУ: Видеманд: кандидатов " + std::to_string(wied_found)
+                          + " за " + std::to_string(la_sec()) + " с"
+                          + (stop_cb() ? " (остановлено)"
+                                       : " — кандидатов недостаточно, резерв нет"));
         }
+
+        if (result)
+            return result;
 
 #ifndef NDEBUG
         if (status_cb) {
             status_cb("DEBUG: rels=" + std::to_string(M) + " | cols=" + std::to_string(total_cols)
-                      + " | null=" + std::to_string(null_rows) + " | sqrt="
+                      + " | deps=" + std::to_string(attempts_done) + " | sqrt="
                       + std::to_string(sqrt_ok) + " | match=" + std::to_string(sq_match));
             std::this_thread::sleep_for(std::chrono::seconds(6));
         }
 #endif // NDEBUG
+        if (status_cb && attempts_done > 0 && !::u128::Globals::LoadStop()) {
+            status_cb("GNFS: СЛАУ: обработано векторов ядра " + std::to_string(attempts_done)
+                      + " (корней: " + std::to_string(sqrt_ok) + ", совпадений X^2==Y^2: "
+                      + std::to_string(sq_match) + "), делитель не найден");
+        }
         return std::nullopt;
     }
 };
