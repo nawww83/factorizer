@@ -337,14 +337,19 @@ struct SparseRow
     size_t orig_idx = 0;        // Индекс соотношения в исходном m_relations
 };
 
-// Фильтрация синглтонов (удаление простых, встретившихся ровно 1 раз)
-inline void filter_singletons(std::vector<SparseRow> &rows, size_t num_cols)
+// Фильтрация синглтонов (удаление простых, встретившихся ровно 1 раз).
+// Возвращает false, если пользователь запросил остановку (LoadStop).
+inline bool filter_singletons(std::vector<SparseRow> &rows, size_t num_cols)
 {
     bool changed = true;
     while (changed) {
+        if (::u128::Globals::LoadStop())
+            return false;
         changed = false;
         std::vector<uint32_t> col_counts(num_cols, 0);
         for (const auto &r : rows) {
+            if (::u128::Globals::LoadStop())
+                return false;
             for (uint32_t c : r.cols) {
                 col_counts[c]++;
             }
@@ -363,6 +368,7 @@ inline void filter_singletons(std::vector<SparseRow> &rows, size_t num_cols)
         });
         rows.erase(it, rows.end());
     }
+    return true;
 }
 
 // --- Основной класс Квадратичного Решета (SIQS) ---
@@ -1042,6 +1048,8 @@ private:
         std::vector<SparseRow> sparse_rows(num_rels);
 
         for (size_t r = 0; r < num_rels; ++r) {
+            if (::u128::Globals::LoadStop())
+                return std::nullopt;
             sparse_rows[r].orig_idx = r;
             if (m_relations[r].is_negative) {
                 sparse_rows[r].cols.push_back(0);
@@ -1059,7 +1067,8 @@ private:
             status_cb("SIQS: Фильтрация матрицы (удаление синглтонов)...");
 
         std::vector<SparseRow> filtered_rows = sparse_rows;
-        filter_singletons(filtered_rows, total_cols);
+        if (!filter_singletons(filtered_rows, total_cols))
+            return std::nullopt; // остановка пользователем
 
         // Если после фильтрации строк осталось недостаточно, используем исходные без фильтрации!
         bool use_filtered = (filtered_rows.size() > total_cols);
@@ -1082,6 +1091,8 @@ private:
 
         std::vector<MatrixRow> matrix(M);
         for (size_t r = 0; r < M; ++r) {
+            if (::u128::Globals::LoadStop())
+                return std::nullopt;
             matrix[r].mask.assign(words, 0);
             matrix[r].history.assign(hist_words, 0);
             matrix[r].history[r / 64] |= (1ULL << (r % 64));
@@ -1103,6 +1114,11 @@ private:
         // 4. Прямой и обратный ход метода Гаусса
         size_t row = 0;
         for (size_t col = 0; col < total_cols && row < M; ++col) {
+            // Самый тяжёлый участок SIQS на крупных числах: без проверки флага
+            // кнопка «Остановить» во время решения СЛАУ не срабатывает вовсе.
+            if (::u128::Globals::LoadStop())
+                return std::nullopt;
+
             size_t col_w = col / 64;
             uint64_t col_mask = 1ULL << (col % 64);
 
@@ -1129,6 +1145,8 @@ private:
                         matrix[r].history[hw] ^= pivot_hist[hw];
                     }
                 }
+                if ((r & 0x3FF) == 0 && ::u128::Globals::LoadStop())
+                    return std::nullopt;
             }
             row++;
         }
@@ -1137,6 +1155,8 @@ private:
         int null_rows_count = 0;
 
         for (size_t r = 0; r < M; ++r) {
+            if ((r & 0xFF) == 0 && ::u128::Globals::LoadStop())
+                return std::nullopt;
             bool all_zero = true;
             for (size_t w = 0; w < words; ++w) {
                 if (matrix[r].mask[w] != 0) {

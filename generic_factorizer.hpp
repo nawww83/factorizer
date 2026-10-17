@@ -241,7 +241,13 @@ T pollard_brent_rho(const T& n, uint64_t max_steps = 200000) {
 
     while (g == T(1) && steps < max_steps && !::u128::Globals::LoadStop()) {
         x = y;
+        // r растёт как 2^k и на последних витках достигает ~100000, поэтому этот
+        // цикл — самый долгий неотменяемый участок ранней стадии. Проверяем
+        // стоп-флаг прямо в нём, иначе кнопка «Остановить» на крупных числах
+        // «залипает» на секунды.
         for (uint64_t i = 0; i < r; ++i) {
+            if ((i & 0x3FF) == 0 && ::u128::Globals::LoadStop())
+                return T(1);
             ::bignum::siqs::square_mod(y, n);
             y = mod_add(y, c, n);
         }
@@ -267,6 +273,8 @@ T pollard_brent_rho(const T& n, uint64_t max_steps = 200000) {
 
     if (g == n) {
         do {
+            if (::u128::Globals::LoadStop())
+                return T(1);
             ::bignum::siqs::square_mod(ys, n);
             ys = mod_add(ys, c, n);
             T diff = (x >= ys) ? (x - ys) : (ys - x);

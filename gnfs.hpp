@@ -24,6 +24,18 @@
 
 namespace bignum::gnfs {
 
+// Пауза, прерываемая запросом остановки: используется там, где раньше висел
+// std::this_thread::sleep_for на несколько секунд и кнопка «Остановить»
+// не могла дождаться конца паузы.
+inline void interruptible_sleep(int ms)
+{
+    for (int waited = 0; waited < ms; waited += 50) {
+        if (::u128::Globals::LoadStop())
+            return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(50, ms - waited)));
+    }
+}
+
 struct RationalPrime
 {
     uint32_t p;
@@ -1042,8 +1054,9 @@ public:
                           + " (чистых: " + std::to_string(m_full_relations_count)
                           + ", пар: " + std::to_string(m_combined_count) + ")");
             }
-            // Задержка, чтобы успеть прочитать статус на экране / в UI
-            std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            // Задержка, чтобы успеть прочитать статус на экране / в UI.
+            // Прерываемая: при нажатии «Остановить» не ждём все 5 секунд.
+            interruptible_sleep(5000);
             return std::nullopt;
         }
 
@@ -1055,7 +1068,8 @@ public:
         // 2. Если СЛАУ завершилась неудачей, выводим статус и делаем паузу
         if (!result.has_value() && status_cb) {
             status_cb("GNFS: СЛАУ не нашла нетривиальных делителей (возврат std::nullopt)");
-            std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            // Прерываемая пауза, чтобы не задерживать остановку пользователем.
+            interruptible_sleep(5000);
         }
 
         return result;
@@ -1381,7 +1395,7 @@ private:
                               static_cast<unsigned long long>(p_max_afb));
                 status_cb(buf);
                 if (refusal_delay_ms > 0)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(refusal_delay_ms));
+                    interruptible_sleep(refusal_delay_ms);
             }
             return false;
         }
@@ -1680,7 +1694,7 @@ private:
                           + std::to_string(m_max_b) + "). Собрано строк: "
                           + std::to_string(m_relations.size()) + " / "
                           + std::to_string(m_relations_needed));
-                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+                interruptible_sleep(5000);
             }
         }
     }
@@ -2880,7 +2894,7 @@ private:
             status_cb("DEBUG: rels=" + std::to_string(M) + " | cols=" + std::to_string(total_cols)
                       + " | deps=" + std::to_string(attempts_done) + " | sqrt="
                       + std::to_string(sqrt_ok) + " | match=" + std::to_string(sq_match));
-            std::this_thread::sleep_for(std::chrono::seconds(6));
+            interruptible_sleep(6000);
         }
 #endif // NDEBUG
         if (status_cb && attempts_done > 0 && !::u128::Globals::LoadStop()) {
