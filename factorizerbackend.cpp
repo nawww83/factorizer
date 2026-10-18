@@ -355,9 +355,19 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
 
     const bool skipEcm = m_skipEcm;
     const bool gnfsPreferred = m_gnfsPreferred;
+
+    // Сразу проговариваем в строке статуса, будет ли вообще применён ECM:
+    // он работает только для чисел от 136 бит (меньшие мгновенно раскладывает
+    // быстрый SIQS) и целиком отключается переключателем «Пропускать ECM».
+    QString ecmNote;
+    if (skipEcm)
+        ecmNote = ", ECM отключён (Пропускать ECM)";
+    else if (val.bitLength <= 135)
+        ecmNote = ", ECM не применяется (≤135 бит — быстрый SIQS)";
+
     setStatus(QString("Выполняется факторизация (%1 бит)%2...")
                   .arg(val.bitLength)
-                  .arg(skipEcm ? ", ECM пропущен" : ""));
+                  .arg(ecmNote));
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
