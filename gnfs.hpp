@@ -3,6 +3,7 @@
 #include "siqs.hpp"
 #include "u128.hpp"
 #include "u128_utils.h"
+#include "cpu_topology.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -83,7 +84,7 @@ struct GnfsParams
 // Поэтому выше 150 бит возвращаем nullopt: раньше тиры до 400 бит лишь
 // удлиняли отказ — построение факторных баз с поиском корней стоило 10-54 с,
 // после чего решето всё равно не запускалось.
-inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits)
+inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits, bool force = false)
 {
     GnfsParams p;
     if (bits <= 150) {
@@ -91,6 +92,14 @@ inline std::optional<GnfsParams> select_gnfs_params(uint32_t bits)
         // 3000/5000: больший предел гладкости заметно повышает выход на
         // 135-150 битах (u нормы падает ~ на 0.3-0.5, rho — в 2-3 раза),
         // запас по b (300000) покрывает «невезучие» числа.
+        p.d = 4;  p.rfb_size = 6000;  p.afb_size = 9000;  p.qcb_size = 48;
+        p.sieve_A = 65536; p.max_b = 300000; p.lp_mult = 400;
+    } else if (force) {
+        // Пользователь явно выбрал GNFS — запускаем на максимальных параметрах
+        // без ограничения по разрядности. Числа крупнее ~150 бит эта реализация
+        // (линейное решето, base-m полином, плотный Гаусс) соотношений, скорее
+        // всего, не наберёт; оценка достижимости выводится в статус как
+        // предупреждение и запуск не отменяет.
         p.d = 4;  p.rfb_size = 6000;  p.afb_size = 9000;  p.qcb_size = 48;
         p.sieve_A = 65536; p.max_b = 300000; p.lp_mult = 400;
     } else {
@@ -751,6 +760,23 @@ inline size_t gf2_find_kernel_vectors(
 // недостижимо из одного старта (структура цепочек Жордана). Память
 // O(M*(N+M)/64) (~60 МБ при M~15000) — платим только при фактическом
 // обращении; векторы ядра = случайные комбинации базиса (равномерны).
+//
+// Оптимизации (матрица 15k x 15k: ~94 с -> ~65 с на синтетике; на реальной
+// матрице GNFS 15288 x 15050 СЛАУ было 31 с):
+//  1. Одна непрерывная область data[M * row_words]: строка — это сначала
+//     `words` слов маски, затем `hist_words` слов истории; шаг строки кратен
+//     64 байтам. Горячий цикл — XOR хвоста строки целиком (маска + история)
+//     без vector-of-vector и без двух разрозненных областей на строку.
+//  2. Прямой ход без обратной подстановки: исключаем только строки НИЖЕ
+//     опорной. Строки выше уже никогда не станут опорными, а их обнуление —
+//     чистая лишняя работа (прежний вариант с полной редукцией делал её вдвое
+//     больше). Нулевые строки в конце и так дают базис левого ядра.
+//  3. __restrict в горячем цикле: формально строки могут перекрываться (один
+//     буфер), и без него компилятор не векторизует XOR.
+//  Многопоточность здесь не помогает: на матрице 15k узкое место — полоса
+//  памяти (15050 проходов по ~58 МБ), и потоки только добавляли конкуренцию
+//  (замерено: 2 потока — 62 с, 4 — 80 с, 8 — 88 с против 65 с в одном потоке
+//  на 4C/8T i7-8565U).
 inline size_t gf2_dense_kernel_combinations(
     const Gf2Matrix &B, size_t max_candidates,
     const std::function<bool()> &stopped,
@@ -760,59 +786,57 @@ inline size_t gf2_dense_kernel_combinations(
     const size_t N = B.cols_n;
     const size_t words = gf2_words(N);
     const size_t hist_words = gf2_words(M);
+    // Шаг строки — кратно 8 словам (64 байта): ровные блоки для XOR.
+    const size_t row_words = (words + hist_words + 7) & ~size_t(7);
 
-    struct DenseRow
-    {
-        std::vector<uint64_t> mask;
-        std::vector<uint64_t> history;
-    };
-    std::vector<DenseRow> matrix(M);
+    std::vector<uint64_t> data(M * row_words, 0);
     for (size_t r = 0; r < M; ++r) {
-        matrix[r].mask.assign(words, 0);
-        matrix[r].history.assign(hist_words, 0);
-        matrix[r].history[r / 64] |= (1ULL << (r % 64));
+        uint64_t *row = data.data() + r * row_words;
         for (uint32_t k = B.row_ptr[r]; k < B.row_ptr[r + 1]; ++k) {
             const uint32_t c = B.row_cols[k];
-            matrix[r].mask[c / 64] ^= (1ULL << (c % 64));
+            row[c >> 6] ^= (1ULL << (c & 63));
         }
+        row[words + (r >> 6)] |= (1ULL << (r & 63));
     }
 
-    // Прямой ход Гаусса над GF(2) с накоплением истории (линейных комбинаций
-    // исходных строк), дающих текущую строку.
     size_t row = 0;
     for (size_t col = 0; col < N && row < M; ++col) {
-        if ((row & 0xFF) == 0 && stopped())
-            return 0;
-        const size_t col_w = col / 64;
-        const uint64_t col_mask = 1ULL << (col % 64);
+        if ((col & 0xFF) == 0 && stopped())
+            break;
+        const size_t col_w = col >> 6;
+        const uint64_t col_bit = 1ULL << (col & 63);
         size_t pivot = row;
-        while (pivot < M && !(matrix[pivot].mask[col_w] & col_mask))
+        while (pivot < M && !(data[pivot * row_words + col_w] & col_bit))
             ++pivot;
         if (pivot >= M)
             continue;
-        if (row != pivot)
-            std::swap(matrix[row], matrix[pivot]);
-        for (size_t r = 0; r < M; ++r) {
-            if (r != row && (matrix[r].mask[col_w] & col_mask)) {
-                for (size_t w = col_w; w < words; ++w)
-                    matrix[r].mask[w] ^= matrix[row].mask[w];
-                for (size_t w = 0; w < hist_words; ++w)
-                    matrix[r].history[w] ^= matrix[row].history[w];
-            }
+        if (pivot != row) {
+            uint64_t *a = data.data() + row * row_words;
+            uint64_t *b = data.data() + pivot * row_words;
+            std::swap_ranges(a, a + row_words, b);
+        }
+        const uint64_t *__restrict src = data.data() + row * row_words;
+        for (size_t r = row + 1; r < M; ++r) {
+            uint64_t *__restrict dst = data.data() + r * row_words;
+            if (!(dst[col_w] & col_bit))
+                continue;
+            for (size_t w = col_w; w < row_words; ++w)
+                dst[w] ^= src[w];
         }
         ++row;
     }
 
     // Нулевые строки после редукции = базис левого ядра B^T.
-    std::vector<const std::vector<uint64_t> *> basis;
+    std::vector<const uint64_t *> basis;
     for (size_t r = 0; r < M; ++r) {
+        const uint64_t *row = data.data() + r * row_words;
         bool all_zero = true;
         for (size_t w = 0; w < words && all_zero; ++w) {
-            if (matrix[r].mask[w] != 0)
+            if (row[w] != 0)
                 all_zero = false;
         }
         if (all_zero)
-            basis.push_back(&matrix[r].history);
+            basis.push_back(row + words);
     }
     if (basis.empty())
         return 0;
@@ -833,7 +857,7 @@ inline size_t gf2_dense_kernel_combinations(
                 continue; // равномерный случайный набор направлений ядра
             nonzero = true;
             for (size_t w = 0; w < hist_words; ++w)
-                cand[w] ^= (*basis[j])[w];
+                cand[w] ^= basis[j][w];
         }
         if (!nonzero)
             continue; // вырожденный выбор — пропускаем
@@ -871,6 +895,7 @@ class GNFSSolver
     uint64_t m_lp_mult = 250;
     uint8_t m_rat_thresh = 28;
     uint8_t m_alg_thresh = 34;
+    bool m_force = false; // явный выбор GNFS в GUI: без ограничения по разрядности
     std::chrono::steady_clock::time_point m_sieve_start{};
     // Последний вывод статуса (под m_rel_mutex) — троттлинг.
     std::chrono::steady_clock::time_point m_last_status{};
@@ -899,19 +924,20 @@ class GNFSSolver
     std::atomic<bool> m_done{false};
 
 public:
-    explicit GNFSSolver(const T &n)
-        : m_N(n)
+    explicit GNFSSolver(const T &n, bool force = false)
+        : m_N(n), m_force(force)
     {}
 
     std::optional<T> solve(std::function<void(const std::string &)> status_cb = nullptr)
     {
         uint32_t bits = m_N.bit_width();
 
-        // Масштабируемые параметры под разрядность. Числа крупнее рабочей
-        // полосы (~150 бит) получают честный отказ мгновенно: в конвейере
-        // факторизации GNFS выше 150 бит и не вызывается, поэтому пауза перед
-        // отказом здесь не нужна.
-        auto params_opt = select_gnfs_params(bits);
+        // Масштабируемые параметры под разрядность. В авторежиме числа крупнее
+        // рабочей полосы (~150 бит) получают честный отказ мгновенно (в конвейере
+        // факторизации GNFS выше 150 бит и не вызывается). При явном выборе GNFS
+        // в GUI (m_force) запускаемся на максимальных параметрах без ограничения
+        // по разрядности — оценка достижимости ниже только предупреждает.
+        auto params_opt = select_gnfs_params(bits, m_force);
         if (!params_opt.has_value()) {
             if (status_cb) {
                 status_cb("GNFS: " + std::to_string(bits)
@@ -963,7 +989,7 @@ public:
             const uint64_t est_afb_max = estimate_base_max_prime(params.afb_size * 9 / 10);
             if (!estimate_feasibility(est_rfb_max, est_afb_max, est_needed,
                                       "Предварительная оценка (до построения баз)", 0,
-                                      status_cb)) {
+                                      status_cb, m_force)) {
                 return std::nullopt;
             }
         }
@@ -985,7 +1011,7 @@ public:
         if (!estimate_feasibility(m_RFB.back().p, m_AFB.back().p,
                                   m_relations_needed,
                                   "Итоговая оценка по построенным базам", 5000,
-                                  status_cb)) {
+                                  status_cb, m_force)) {
             return std::nullopt;
         }
 
@@ -1008,17 +1034,19 @@ public:
         if (status_cb)
             status_cb("GNFS: Запуск решета (RFB + AFB + Large Primes), b до "
                       + std::to_string(m_max_b) + "...");
-        unsigned num_threads = std::thread::hardware_concurrency();
-        if (num_threads == 0)
-            num_threads = 4;
+        // Только P-ядра: E-ядра на гибридных процессорах заметно медленнее.
+        // Потоки дополнительно закрепляются за P-ядрами (см. pin_current_thread).
+        unsigned num_threads = ::bignum::cpu::worker_thread_count();
 
         std::atomic<uint32_t> b_counter{1};
         std::vector<std::thread> workers;
         workers.reserve(num_threads);
 
         for (unsigned t = 0; t < num_threads; ++t) {
-            workers.emplace_back(
-                [this, &b_counter, status_cb]() { sieve_worker(b_counter, status_cb); });
+            workers.emplace_back([this, &b_counter, status_cb, t]() {
+                ::bignum::cpu::pin_current_thread(t);
+                sieve_worker(b_counter, status_cb);
+            });
         }
 
         for (auto &w : workers) {
@@ -1176,9 +1204,9 @@ private:
         }
 
         size_t prime_scan_limit = std::min(all_primes.size(), afb_target * 3 / 2 + 500);
-        unsigned num_threads = std::thread::hardware_concurrency();
-        if (num_threads == 0)
-            num_threads = 4;
+        // Только P-ядра: E-ядра на гибридных процессорах заметно медленнее.
+        // Потоки дополнительно закрепляются за P-ядрами (см. pin_current_thread).
+        unsigned num_threads = ::bignum::cpu::worker_thread_count();
 
         std::vector<std::vector<AlgebraicPrime>> local_afb(num_threads);
         std::atomic<size_t> next_idx{0};
@@ -1189,6 +1217,7 @@ private:
 
         for (unsigned t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
+                ::bignum::cpu::pin_current_thread(t);
                 const size_t deg = m_coeffs.size() - 1;
                 std::vector<uint32_t> c_mod(deg + 1);
 
@@ -1302,7 +1331,8 @@ private:
     bool estimate_feasibility(uint64_t p_max_rfb, uint64_t p_max_afb,
                               size_t relations_needed, const char *tag,
                               int refusal_delay_ms,
-                              const std::function<void(const std::string &)> &status_cb) const
+                              const std::function<void(const std::string &)> &status_cb,
+                              bool force = false) const
     {
         const double log2_pr = std::log2(static_cast<double>(p_max_rfb));
         const double log2_pa = std::log2(static_cast<double>(p_max_afb));
@@ -1384,20 +1414,32 @@ private:
 
         if (expected < static_cast<double>(relations_needed)) {
             if (status_cb) {
-                char buf[448];
-                std::snprintf(buf, sizeof(buf),
-                              "GNFS: Задача оценена как нереалистичная для этой "
-                              "реализации (ожидается ~%.3g строк, нужно %zu при "
-                              "базах %llu / %llu). Число слишком велико: нужен, "
-                              "например, CADO-NFS на кластере.",
-                              expected, relations_needed,
-                              static_cast<unsigned long long>(p_max_rfb),
-                              static_cast<unsigned long long>(p_max_afb));
+                char buf[640];
+                if (force) {
+                    std::snprintf(buf, sizeof(buf),
+                                  "GNFS: предупреждение: оценка достижимости ниже "
+                                  "нужной (ожидается ~%.3g строк, нужно %zu при "
+                                  "базах %llu / %llu) — GNFS выбран принудительно, "
+                                  "продолжаю как есть. Для чисел такого размера нужен, "
+                                  "например, CADO-NFS на кластере.",
+                                  expected, relations_needed,
+                                  static_cast<unsigned long long>(p_max_rfb),
+                                  static_cast<unsigned long long>(p_max_afb));
+                } else {
+                    std::snprintf(buf, sizeof(buf),
+                                  "GNFS: Задача оценена как нереалистичная для этой "
+                                  "реализации (ожидается ~%.3g строк, нужно %zu при "
+                                  "базах %llu / %llu). Число слишком велико: нужен, "
+                                  "например, CADO-NFS на кластере.",
+                                  expected, relations_needed,
+                                  static_cast<unsigned long long>(p_max_rfb),
+                                  static_cast<unsigned long long>(p_max_afb));
+                }
                 status_cb(buf);
-                if (refusal_delay_ms > 0)
+                if (!force && refusal_delay_ms > 0)
                     interruptible_sleep(refusal_delay_ms);
             }
-            return false;
+            return force;
         }
         return true;
     }
@@ -1578,20 +1620,24 @@ private:
                             continue;
                         }
 
-                        std::vector<uint32_t> r_idx;
-                        std::vector<uint16_t> r_pow;
-                        uint64_t large_rat = 1;
-                        if (!factor_over_rfb(rat_norm, r_idx, r_pow, large_rat)) {
-                            m_stat_rat_fail++;
-                            continue;
-                        }
-
                         std::vector<uint32_t> a_idx;
                         std::vector<uint16_t> a_pow;
                         uint64_t large_alg = 1;
                         uint32_t large_alg_r = 0;
-                        if (!factor_over_afb(alg_norm, a, b, a_idx, a_pow, large_alg, large_alg_r)) {
+                        std::vector<uint32_t> r_idx;
+                        std::vector<uint16_t> r_pow;
+                        uint64_t large_rat = 1;
+
+                        // Алгебраическая сторона — первой: её факторизация
+                        // дороже, и ранний отсев (см. factor_over_afb)
+                        // отбрасывает безнадёжные нормы за ~20 шагов.
+                        if (!factor_over_afb(alg_norm, a, b, alg_sieve.at(j), a_idx, a_pow,
+                                             large_alg, large_alg_r)) {
                             m_stat_afb_fail++;
+                            continue;
+                        }
+                        if (!factor_over_rfb(rat_norm, r_idx, r_pow, large_rat)) {
+                            m_stat_rat_fail++;
                             continue;
                         }
 
@@ -1782,6 +1828,7 @@ private:
     bool factor_over_afb(T rem,
                          int64_t a,
                          uint32_t b,
+                         uint32_t sieve_log,
                          std::vector<uint32_t> &idx_out,
                          std::vector<uint16_t> &pow_out,
                          uint64_t &large_prime_out,
@@ -1790,6 +1837,10 @@ private:
         large_prime_out = 1;
         large_r_out = 0;
 
+        const uint32_t lp_bits = (m_L_alg_max > 1)
+                                     ? static_cast<uint32_t>(64 - std::countl_zero(m_L_alg_max - 1))
+                                     : 0u;
+        uint32_t l_done = 0;
         const T max_u64_T(std::numeric_limits<uint64_t>::max());
         bool fits_u64 = (rem <= max_u64_T);
         uint64_t rem64 = fits_u64 ? ::u128::utils::to_u64_low(rem) : 0;
@@ -1797,6 +1848,23 @@ private:
         for (size_t i = 0; i < m_AFB.size(); ++i) {
             uint32_t p = m_AFB.at(i).p;
             uint32_t r = m_AFB.at(i).r;
+
+            // Ранний отсев (главная оптимизация решета). Решето уже посчитало
+            // L = сумму log(p) простых AFB, делящих норму — каждого по одному
+            // разу, без кратностей. Оставшиеся делящие простые дают
+            // произведение <= 2^(L - l_done), поэтому остаток после всех
+            // делений не меньше rem / 2^(L - l_done). Если даже он больше
+            // границы Large Prime, норму разложить нельзя: выходим сразу, не
+            // перебирая тысячи оставшихся простых (обычно хватает ~20 шагов
+            // вместо 9000 на кандидата).
+            if ((i & 7) == 0 && p >= 64) {
+                const uint32_t rb = fits_u64
+                                        ? static_cast<uint32_t>(64 - std::countl_zero(rem64))
+                                        : static_cast<uint32_t>(rem.bit_width());
+                const uint32_t l_rem = (sieve_log > l_done) ? (sieve_log - l_done) : 0u;
+                if (rb > l_rem + lp_bits + 2)
+                    return false;
+            }
 
             if (fits_u64) {
                 if (rem64 == 1)
@@ -1837,6 +1905,8 @@ private:
                         cnt++;
                         rem64 /= p;
                     } while (rem64 % p == 0);
+                    if (p > 2)
+                        l_done += m_AFB.at(i).log_p;
                     idx_out.push_back(static_cast<uint32_t>(i));
                     pow_out.push_back(cnt);
                 }
@@ -1851,6 +1921,8 @@ private:
                         cnt++;
                         rem = ::bignum::siqs::div_by_u32(rem, p);
                     } while (rem > T(1) && ::bignum::siqs::rem_u32(rem, p) == 0);
+                    if (p > 2)
+                        l_done += m_AFB.at(i).log_p;
                     idx_out.push_back(static_cast<uint32_t>(i));
                     pow_out.push_back(cnt);
                     if (rem <= max_u64_T) {
@@ -2083,11 +2155,23 @@ private:
         return prod;
     }
 
+    // Верхняя оценка числа бит коэффициента двучлена (a - b*x).
+    static size_t binomial_bits(int64_t a, uint32_t b)
+    {
+        const uint64_t ua = static_cast<uint64_t>(a < 0 ? -a : a);
+        return static_cast<size_t>(std::max<int>(std::bit_width(ua), std::bit_width(b)));
+    }
+
     // Быстрое дерево умножения линейных двучленов (a - b*x) по модулю (f(x), q^K).
-    // Каждый уровень хранит только нужную ему точность: коэффициенты произведения
-    // n линейных множителей растут как n*(бит_множителя + log2 n). Если хранить
-    // все узлы сразу в полной точности K, нижние уровни дерева съедают
-    // O(число_узлов * K) памяти (десятки ГБ на реальных объёмах строк).
+    // Каждый узел хранит только нужную ему точность: его коэффициенты ограничены
+    // суммой бит листьев плюс биномиальные коэффициенты (максимум n бит) и
+    // накопленный запас на редукцию по f. Если хранить все узлы сразу в полной
+    // точности K, нижние уровни дерева съедают O(число_узлов * K) памяти
+    // (десятки ГБ на реальных объёмах строк).
+    //
+    // Прежняя оценка брала фиксированные factor_bits=20 на лист, что для реальных
+    // соотношений (|a| ~ 2^40) занижало точность узлов и обрезало старшие цифры
+    // произведения. Здесь границы считаются по фактическим |a|, b.
     std::vector<RadixQ> build_product_tree_rq(const std::vector<std::pair<int64_t, uint32_t>> &pairs,
                                               const std::vector<RadixQ> &f_rq,
                                               uint32_t q,
@@ -2095,13 +2179,24 @@ private:
     {
         size_t d = m_d;
         const size_t q_bits = static_cast<size_t>(32 - std::countl_zero(q));
-        const uint64_t factor_bits = 20; // |a|, b < 2^17 с запасом
+        // При редукции по f к коэффициенту добавляется lead*f_j, причём результат
+        // сам может стать lead на следующем шаге: за одну редукцию коэффициент
+        // умножается на f до (d-1) раз. Плюс log2(d) на суммирование d слагаемых
+        // при перемножении узлов. Без этого запаса точность узлов занижалась бы
+        // и старшие цифры (знак) терялись.
+        size_t f_bits = 0;
+        for (size_t j = 0; j < d; ++j)
+            f_bits = std::max<size_t>(f_bits, m_coeffs.at(j).bit_width());
+        const size_t reduce_extra = (d > 1 ? d - 1 : 1) * f_bits
+                                    + 2 * static_cast<size_t>(std::bit_width(d)) + 2;
 
-        auto level_digits = [&](size_t covered) -> size_t {
-            uint64_t bits = static_cast<uint64_t>(covered)
-                            * (factor_bits + (64 - std::countl_zero(covered)));
-            size_t digits = (bits + q_bits - 1) / q_bits + 4;
-            return std::min(K, digits);
+        // Сколько цифр базы q достаточно узлу, коэффициенты которого
+        // ограничены bits битами. +4 цифры запаса: старшие цифры остаются чисто
+        // знаковыми (0 или q-1), поэтому rq_extend_sign при переходе на бóльшую
+        // точность корректен.
+        auto digits_for_bits = [&](uint64_t bits) -> size_t {
+            const uint64_t digits = (bits + q_bits - 1) / q_bits + 4;
+            return static_cast<size_t>(std::min<uint64_t>(K, digits));
         };
 
         // Знаковое расширение уравновешенного представления: см. rq_extend_sign.
@@ -2112,31 +2207,44 @@ private:
         };
 
         std::vector<std::vector<RadixQ>> level;
+        std::vector<uint64_t> node_bits;
         level.reserve(pairs.size());
+        node_bits.reserve(pairs.size());
 
-        const size_t k_leaf = level_digits(1);
         for (const auto &ab : pairs) {
+            const uint64_t bits = binomial_bits(ab.first, ab.second);
+            const size_t k_leaf = digits_for_bits(bits);
             std::vector<RadixQ> lin(d, RadixQ(k_leaf, 0));
             lin.at(0) = rq_from_signed(ab.first, q, k_leaf);
             lin.at(1) = rq_from_signed(-static_cast<int64_t>(ab.second), q, k_leaf);
             level.push_back(std::move(lin));
+            node_bits.push_back(bits);
         }
 
-        size_t covered = 1;
         while (level.size() > 1) {
-            covered *= 2;
-            const size_t k_lvl = level_digits(covered);
             std::vector<std::vector<RadixQ>> next_level;
+            std::vector<uint64_t> next_bits;
             next_level.reserve((level.size() + 1) / 2);
+            next_bits.reserve((level.size() + 1) / 2);
             for (size_t i = 0; i + 1 < level.size(); i += 2) {
+                const uint64_t bits = node_bits.at(i) + node_bits.at(i + 1) + reduce_extra;
+                const size_t k_lvl = digits_for_bits(bits);
                 auto lhs = extend_node(std::move(level.at(i)), k_lvl);
                 auto rhs = extend_node(std::move(level.at(i + 1)), k_lvl);
                 next_level.push_back(poly_mul_radix_q(lhs, rhs, f_rq, q, k_lvl));
+                next_bits.push_back(bits);
             }
             if (level.size() & 1) {
-                next_level.push_back(extend_node(std::move(level.back()), k_lvl));
+                next_level.push_back(std::move(level.back()));
+                next_bits.push_back(node_bits.back());
             }
             level = std::move(next_level);
+            node_bits = std::move(next_bits);
+        }
+        if (level.empty()) {
+            std::vector<RadixQ> one(d, RadixQ(1, 0));
+            one.at(0).at(0) = 1;
+            return one;
         }
         return level.at(0);
     }
@@ -2147,12 +2255,19 @@ private:
         uint32_t q = 0;
         std::vector<uint32_t> f_mod_q(m_d + 1, 0);
 
-        // Подбираем КРУПНЕЙШее допустимое q (< 2^16, ≡ 3 mod 4): каждая цифра
-        // базы q несёт ~16 бит вместо ~11 у крошечного q≈2000, число цифр K
-        // падает в ~1.5 раза, а все операции в базе q (дерево произведений,
-        // подъём Ньютона) стоят O(K^2) — суммарный выигрыш ~2.5x на извлечении
-        // корня. Проверка неприводимости — быстрая (Фробениус), O(d^3 log q).
-        for (uint32_t cand = 65519; cand >= 2003; cand -= 4) {
+        // Подбираем КРУПНЕЙШЕЕ допустимое q: каждая цифра базы q несёт log2(q)
+        // бит, поэтому K ~ 1/log2(q), а все операции в базе q (дерево
+        // произведений, подъём Ньютона) стоят O(K^2) — время ~ 1/(log2 q)^2.
+        // Переход с 16 на 24 бита сокращает K в 1.5 раза и извлечение корня
+        // ещё в ~2.2 раза.
+        // Ограничения: q^d должно помещаться в экспоненты поля F_{q^d} (U128),
+        // а rq_mul копит K произведений цифр в uint64: K*(q-1)^2 < 2^64
+        // (K <= ~30000 при q < 2^24 — с большим запасом).
+        // Проверка неприводимости — быстрая (Фробениус), O(d^3 log q).
+        const size_t q_bit_cap =
+            std::min<size_t>(24, static_cast<size_t>(120) / std::max<size_t>(1, m_d));
+        for (uint32_t cand = static_cast<uint32_t>((uint64_t(1) << q_bit_cap) - 1) | 1u;
+             cand >= 2003; cand -= 2) {
             bool is_p = true;
             for (uint32_t div = 3; 1ULL * div * div <= cand; div += 2) {
                 if (cand % div == 0) {
@@ -2353,121 +2468,184 @@ private:
         if (!sqrt_field_ok)
             return std::nullopt;
 
-        // 3. Оцениваем глубину подъема K (в разрядах по основанию q).
-        // Коэффициенты целочисленного корня g (если он существует) имеют порядок
-        // ~2^(пара·27) бит (максимальное вложение |a - b*rho| ~ b*m); чтобы
-        // центрированное представление не «заворачивалось», берём запас ×2.
-        size_t total_bits_needed = (pairs.size() * (m_m.bit_width() + 20)) + m_N.bit_width() * 2
-                                   + 128;
-        size_t q_bits = static_cast<size_t>(std::max(10.0, std::floor(std::log2(q))));
-        size_t target_K = (total_bits_needed + q_bits - 1) / q_bits + 4;
-
-        std::vector<RadixQ> f_full(m_d + 1);
-        for (size_t i = 0; i <= m_d; ++i) {
-            f_full.at(i) = rq_from_T(m_coeffs.at(i), q, target_K);
+        // 3. Оцениваем глубину подъёма K (в разрядах по основанию q).
+        // Norm(P) = prod |F(a,b)| * Norm(f')^2, а коэффициенты целочисленного
+        // корня g (P = g^2 в Z[alpha], d сопряжённых) имеют порядок
+        // Norm(P)^(1/(2d)). Это оценка по норме: она заметно точнее прежней
+        // pairs*(bits(m)+20) и грубой границы «сумма бит множителей», которые
+        // завышали K в 1.5–4 раза, а все операции в базе q стоят O(K^2).
+        // Множитель 1.5 — запас на разброс модулей сопряжённых (вложение);
+        // если его не хватит, цикл ниже повторяет подъём с большим K.
+        double norm_bits = 0.0;
+        for (size_t idx : dep_rels) {
+            const auto &rel = m_relations.at(idx);
+            for (size_t k = 0; k < rel.alg_idx.size(); ++k)
+                norm_bits += rel.alg_pow[k]
+                             * std::log2(static_cast<double>(m_AFB.at(rel.alg_idx[k]).p));
+            if (rel.large_alg_p > 1)
+                norm_bits += std::log2(static_cast<double>(rel.large_alg_p));
         }
+        uint64_t need_bits = static_cast<uint64_t>(norm_bits * 1.5 / (2.0 * m_d)) + 512;
 
-        // Вычисляем f'(x)^2 в базе q^target_K
-        std::vector<RadixQ> f_deriv_rq(m_d, RadixQ(target_K, 0));
-        for (size_t i = 1; i <= m_d; ++i) {
-            RadixQ deg_rq = rq_from_signed(static_cast<int64_t>(i), q, target_K);
-            f_deriv_rq.at(i - 1) = rq_mul(f_full.at(i), deg_rq, q, target_K);
-        }
-        auto f_deriv_sq_rq = poly_mul_radix_q(f_deriv_rq, f_deriv_rq, f_full, q, target_K);
+        const size_t q_bits = static_cast<size_t>(std::bit_width(q - 1));
+        auto digits_for_bits = [&](uint64_t bits) -> size_t {
+            return static_cast<size_t>((bits + q_bits - 1) / q_bits) + 4;
+        };
 
-        auto prod_full = build_product_tree_rq(pairs, f_full, q, target_K);
-        for (auto &coeff : prod_full)
-            coeff = rq_extend_sign(std::move(coeff), target_K, q);
-        prod_full = poly_mul_radix_q(prod_full, f_deriv_sq_rq, f_full, q, target_K);
+        // Высокоточная часть для заданной глубины K: f, P = f'^2*prod(a-bx),
+        // подъём Ньютона—Гензеля S и итоговый корень P*S.
+        auto lift_root = [&](size_t K, std::vector<RadixQ> &f_out,
+                             std::vector<RadixQ> &prod_out, std::vector<RadixQ> &sqrt_out) {
+            f_out.assign(m_d + 1, RadixQ(K, 0));
+            for (size_t i = 0; i <= m_d; ++i)
+                f_out.at(i) = rq_from_T(m_coeffs.at(i), q, K);
 
-        if (negate_prod) {
-            RadixQ zero_rq(target_K, 0);
-            for (size_t i = 0; i < m_d; ++i) {
-                prod_full.at(i) = rq_sub(zero_rq, prod_full.at(i), q, target_K);
+            // f'(x)^2 в базе q^K
+            std::vector<RadixQ> f_deriv_rq(m_d, RadixQ(K, 0));
+            for (size_t i = 1; i <= m_d; ++i) {
+                RadixQ deg_rq = rq_from_signed(static_cast<int64_t>(i), q, K);
+                f_deriv_rq.at(i - 1) = rq_mul(f_out.at(i), deg_rq, q, K);
             }
-        }
+            auto f_deriv_sq_rq = poly_mul_radix_q(f_deriv_rq, f_deriv_rq, f_out, q, K);
 
-        // 4. Квадратичный подъем Ньютона — Гензеля: K = 1 -> 2 -> 4 -> ... -> target_K
-        size_t cur_K = 1;
-        std::vector<RadixQ> S(m_d, RadixQ(1, 0));
-        for (size_t i = 0; i < m_d; ++i) {
-            S.at(i).at(0) = inv_sqrt_q.at(i);
-        }
+            prod_out = build_product_tree_rq(pairs, f_out, q, K);
+            for (auto &coeff : prod_out)
+                coeff = rq_extend_sign(std::move(coeff), K, q);
+            prod_out = poly_mul_radix_q(prod_out, f_deriv_sq_rq, f_out, q, K);
 
-        uint32_t inv2_q = (q + 1) / 2;
-
-        while (cur_K < target_K) {
-            size_t next_K = std::min(cur_K * 2, target_K);
-
-            std::vector<RadixQ> f_cur(m_d + 1, RadixQ(next_K, 0));
-            for (size_t i = 0; i <= m_d; ++i) {
-                std::copy_n(f_full.at(i).begin(), next_K, f_cur.at(i).begin());
+            if (negate_prod) {
+                RadixQ zero_rq(K, 0);
+                for (size_t i = 0; i < m_d; ++i)
+                    prod_out.at(i) = rq_sub(zero_rq, prod_out.at(i), q, K);
             }
 
-            std::vector<RadixQ> prod_cur(m_d, RadixQ(next_K, 0));
-            for (size_t i = 0; i < m_d; ++i) {
-                std::copy_n(prod_full.at(i).begin(), next_K, prod_cur.at(i).begin());
-                S.at(i) = rq_extend_sign(std::move(S.at(i)), next_K, q);
-            }
-            auto S2 = poly_mul_radix_q(S, S, f_cur, q, next_K);
-            auto P_S2 = poly_mul_radix_q(prod_cur, S2, f_cur, q, next_K);
-            std::vector<RadixQ> three_minus(m_d, RadixQ(next_K, 0));
-            RadixQ three_rq(next_K, 0);
-            three_rq.at(0) = 3;
-            RadixQ zero_rq(next_K, 0);
-            RadixQ half_rq(next_K, 0);
-            half_rq.at(0) = inv2_q;
-            for (size_t k = 1; k < next_K; ++k) {
-                half_rq.at(k) = (q - 1) / 2;
-            }
-            for (size_t i = 0; i < m_d; ++i) {
-                if (i == 0) {
-                    three_minus.at(0) = rq_sub(three_rq, P_S2.at(0), q, next_K);
-                } else {
-                    three_minus.at(i) = rq_sub(zero_rq, P_S2.at(i), q, next_K);
+            // 4. Квадратичный подъем Ньютона — Гензеля: K = 1 -> 2 -> 4 -> ... -> K
+            size_t cur_K = 1;
+            std::vector<RadixQ> S(m_d, RadixQ(1, 0));
+            for (size_t i = 0; i < m_d; ++i)
+                S.at(i).at(0) = inv_sqrt_q.at(i);
+
+            const uint32_t inv2_q = (q + 1) / 2;
+
+            while (cur_K < K) {
+                size_t next_K = std::min(cur_K * 2, K);
+
+                std::vector<RadixQ> f_cur(m_d + 1, RadixQ(next_K, 0));
+                for (size_t i = 0; i <= m_d; ++i) {
+                    std::copy_n(f_out.at(i).begin(), next_K, f_cur.at(i).begin());
                 }
-                three_minus.at(i) = rq_mul(three_minus.at(i), half_rq, q, next_K);
-            }
-            S = poly_mul_radix_q(S, three_minus, f_cur, q, next_K);
-            cur_K = next_K;
-        }
 
-        auto sqrt_rq = poly_mul_radix_q(prod_full, S, f_full, q, target_K);
+                std::vector<RadixQ> prod_cur(m_d, RadixQ(next_K, 0));
+                for (size_t i = 0; i < m_d; ++i) {
+                    std::copy_n(prod_out.at(i).begin(), next_K, prod_cur.at(i).begin());
+                    S.at(i) = rq_extend_sign(std::move(S.at(i)), next_K, q);
+                }
+                auto S2 = poly_mul_radix_q(S, S, f_cur, q, next_K);
+                auto P_S2 = poly_mul_radix_q(prod_cur, S2, f_cur, q, next_K);
+                std::vector<RadixQ> three_minus(m_d, RadixQ(next_K, 0));
+                RadixQ three_rq(next_K, 0);
+                three_rq.at(0) = 3;
+                RadixQ zero_rq(next_K, 0);
+                RadixQ half_rq(next_K, 0);
+                half_rq.at(0) = inv2_q;
+                for (size_t k = 1; k < next_K; ++k) {
+                    half_rq.at(k) = (q - 1) / 2;
+                }
+                for (size_t i = 0; i < m_d; ++i) {
+                    if (i == 0) {
+                        three_minus.at(0) = rq_sub(three_rq, P_S2.at(0), q, next_K);
+                    } else {
+                        three_minus.at(i) = rq_sub(zero_rq, P_S2.at(i), q, next_K);
+                    }
+                    three_minus.at(i) = rq_mul(three_minus.at(i), half_rq, q, next_K);
+                }
+                S = poly_mul_radix_q(S, three_minus, f_cur, q, next_K);
+                cur_K = next_K;
+            }
+
+            sqrt_out = poly_mul_radix_q(prod_out, S, f_out, q, K);
+        };
+
+        // Целочисленный корень обязан помещаться в q^K/2: старшие цифры каждого
+        // коэффициента — чистый знаковый залив (0 или q-1). Если старшие цифры
+        // «шумят», подъём дал q-адический корень нецелого числа — K мало.
+        auto root_fits = [&](const std::vector<RadixQ> &c_rq, size_t K) {
+            for (const auto &c : c_rq) {
+                const uint32_t fill = (c.back() > q / 2) ? (q - 1) : 0;
+                size_t free_digits = 0;
+                while (free_digits < K && c.at(K - 1 - free_digits) == fill)
+                    ++free_digits;
+                if (free_digits < 3)
+                    return false;
+            }
+            return true;
+        };
+
+        std::vector<RadixQ> f_full;
+        std::vector<RadixQ> prod_full;
+        std::vector<RadixQ> sqrt_rq;
+        size_t target_K = digits_for_bits(need_bits);
+        bool root_ok = false;
+        for (int k_attempt = 0; k_attempt < 4 && !root_ok; ++k_attempt) {
+            lift_root(target_K, f_full, prod_full, sqrt_rq);
+            root_ok = root_fits(sqrt_rq, target_K);
 
 #ifndef NDEBUG
-        // ДИАГНОСТИКА: самопроверка подъёма — sqrt_rq^2 == P (mod q^K) поцифрово.
-        // Если сломан подъём — BROKEN; если OK, а Y^2 != X^2, то единица в Z[alpha]
-        // не является квадратом (подъём даёт q-адический, а не целочисленный корень)
-        // либо целочисленный корень не поместился в q^K (тогда used_bits ~= K*q_bits).
-        {
-            auto sq_full = poly_mul_radix_q(sqrt_rq, sqrt_rq, f_full, q, target_K);
-            bool ok_K = true;
-            for (size_t i = 0; i < m_d && ok_K; ++i) {
-                if (sq_full.at(i) != prod_full.at(i))
-                    ok_K = false;
+            // ДИАГНОСТИКА: самопроверка подъёма — sqrt_rq^2 == P (mod q^K) поцифрово.
+            // Если сломан подъём — BROKEN; если OK, а Y^2 != X^2, то единица в Z[alpha]
+            // не является квадратом (подъём даёт q-адический, а не целочисленный корень)
+            // либо целочисленный корень не поместился в q^K (тогда used_bits ~= K*q_bits).
+            {
+                auto sq_full = poly_mul_radix_q(sqrt_rq, sqrt_rq, f_full, q, target_K);
+                bool ok_K = true;
+                for (size_t i = 0; i < m_d && ok_K; ++i) {
+                    if (sq_full.at(i) != prod_full.at(i))
+                        ok_K = false;
+                }
+                // Оценка по норме: |коэффициенты корня| ~ Norm(P)^(1/(2d)).
+                size_t predicted_norm = static_cast<size_t>(norm_bits / (2.0 * m_d));
+                // «Использованные биты» центрированного корня: сколько старших цифр
+                // занято знаковыми разрядами (0 — для положительных, q-1 — для отрицательных).
+                size_t q_bits_diag = static_cast<size_t>(std::max(10.0, std::floor(std::log2(q))));
+                size_t prod_used = 0;
+                for (size_t i = 0; i < m_d; ++i) {
+                    const RadixQ &c = prod_full.at(i);
+                    uint32_t fill = (c.back() > q / 2) ? (q - 1) : 0;
+                    size_t first = 0;
+                    while (first < target_K && c.at(target_K - 1 - first) == fill)
+                        ++first;
+                    prod_used = std::max(prod_used, (target_K - first) * q_bits_diag);
+                }
+                size_t used_bits = 0;
+                for (size_t i = 0; i < m_d; ++i) {
+                    const RadixQ &c = sqrt_rq.at(i);
+                    uint32_t fill = (c.back() > q / 2) ? (q - 1) : 0;
+                    size_t first = 0;
+                    while (first < target_K && c.at(target_K - 1 - first) == fill)
+                        ++first;
+                    size_t bits_here = (target_K - first) * q_bits_diag;
+                    if (bits_here > used_bits)
+                        used_bits = bits_here;
+                }
+                std::fprintf(stderr,
+                             "DIAG sqrt: q=%u target_K=%zu (%zu бит) pairs=%zu "
+                             "need_bits=%llu norm_pred=%zu negate=%d "
+                             "sqrt^2==P(mod q^K):%s prod_used=%zu used_bits=%zu fits=%d\n",
+                             q, target_K, target_K * q_bits_diag, pairs.size(),
+                             static_cast<unsigned long long>(need_bits), predicted_norm,
+                             static_cast<int>(negate_prod), ok_K ? "OK" : "BROKEN", prod_used,
+                             used_bits, static_cast<int>(root_ok));
+                std::fflush(stderr);
             }
-            // «Использованные биты» центрированного корня: сколько старших цифр
-            // занято знаковыми разрядами (0 — для положительных, q-1 — для отрицательных).
-            size_t q_bits_diag = static_cast<size_t>(std::max(10.0, std::floor(std::log2(q))));
-            size_t used_bits = 0;
-            for (size_t i = 0; i < m_d; ++i) {
-                const RadixQ &c = sqrt_rq.at(i);
-                uint32_t fill = (c.back() > q / 2) ? (q - 1) : 0;
-                size_t first = 0;
-                while (first < target_K && c.at(target_K - 1 - first) == fill)
-                    ++first;
-                size_t bits_here = (target_K - first) * q_bits_diag;
-                if (bits_here > used_bits)
-                    used_bits = bits_here;
-            }
-            std::fprintf(stderr,
-                         "DIAG sqrt: q=%u target_K=%zu (%zu бит) pairs=%zu negate=%d "
-                         "sqrt^2==P(mod q^K):%s used_bits=%zu\n",
-                         q, target_K, target_K * q_bits_diag, pairs.size(),
-                         static_cast<int>(negate_prod), ok_K ? "OK" : "BROKEN", used_bits);
-            std::fflush(stderr);
-        }
 #endif // NDEBUG
+
+            if (!root_ok) {
+                need_bits = static_cast<uint64_t>(need_bits * 1.6);
+                target_K = digits_for_bits(need_bits);
+            }
+        }
+        if (!root_ok)
+            return std::nullopt;
 
         // 5. Переводим центрированные коэффициенты из базы q в Z_N и подставляем x = m
         T Y = T(0);
@@ -2590,7 +2768,7 @@ private:
         };
 
         // Выбор алгоритма по бюджету памяти (замеры на реальной GNFS-матрице
-        // 15286x15050, nnz~610k): плотный Гаусс с матрицей истории — ~18 с и
+        // 15286x15050, nnz~610k): плотный Гаусс с матрицей истории — ~17 с и
         // ~58 МБ, детерминированно точен. Итерационный Видеманд на таких
         // матрицах сходится плохо (~2-3% попыток, ~64 с/попытка: реальные
         // GNFS-матрицы структурно «патологичны» — левое ядро B^T недостижимо
@@ -2598,8 +2776,11 @@ private:
         // масштабируется: при M~10^5 плотный Гаусс потребовал бы ~2.5 ГБ.
         // Поэтому: матрица укладывается в бюджет памяти — идём точным
         // Гауссом; не укладывается — Видеманд с большим бюджетом попыток.
-        const size_t dense_bytes = M * (detail::gf2_words(total_cols) + detail::gf2_words(M))
-                                   * sizeof(uint64_t);
+        // Шаг строки в решателе выровнен на 8 слов (64 байта) — учитываем это
+        // в оценке памяти, иначе бюджет занижается на ~7 слов на строку.
+        const size_t dense_row_words =
+            (detail::gf2_words(total_cols) + detail::gf2_words(M) + 7) & ~size_t(7);
+        const size_t dense_bytes = M * dense_row_words * sizeof(uint64_t);
         constexpr uint64_t kDenseBudgetBytes = 128ull << 20; // 128 МБ
         const bool dense_first = dense_bytes <= kDenseBudgetBytes;
         if (status_cb)
@@ -2907,9 +3088,10 @@ private:
 };
 template<typename T>
 inline std::optional<T> number_field_sieve(
-    const T &n, std::function<void(const std::string &)> status_cb = nullptr)
+    const T &n, std::function<void(const std::string &)> status_cb = nullptr,
+    bool force = false)
 {
-    GNFSSolver<T> solver(n);
+    GNFSSolver<T> solver(n, force);
     return solver.solve(status_cb);
 }
 } // namespace bignum::gnfs

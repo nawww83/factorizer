@@ -3,6 +3,7 @@
 #include "gnfs.hpp"
 #include "siqs.hpp"
 #include "u128_utils.h"
+#include "cpu_topology.hpp"
 
 #include <vector>
 #include <string>
@@ -677,8 +678,9 @@ std::optional<T> ecm_parallel(const T& n,
     auto primes = ::u128::utils::primes(B1);
     auto is_prime_table = make_prime_sieve(B2);
 
-    unsigned num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
+    // Только P-ядра: E-ядра на гибридных процессорах заметно медленнее.
+    // Потоки дополнительно закрепляются за P-ядрами (см. pin_current_thread).
+    unsigned num_threads = ::bignum::cpu::worker_thread_count();
 
     std::atomic<bool> found{false};
     std::atomic<uint32_t> curve_counter{0};
@@ -690,6 +692,7 @@ std::optional<T> ecm_parallel(const T& n,
 
     for (unsigned t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t]() {
+            ::bignum::cpu::pin_current_thread(t);
             while (!found.load(std::memory_order_relaxed) &&
                    !::u128::Globals::LoadStop()) {
                 uint32_t c_idx = curve_counter.fetch_add(1);
@@ -738,15 +741,28 @@ std::optional<T> ecm_parallel(const T& n,
 //  - SIQS: 200 бит — ~3 с, 256 бит — ~30 мин, 288 бит — ~3 ч, 320 бит — ~70 ч;
 //    выше 320 бит его тоже не запускаем (сутки и более на число — не результат).
 constexpr unsigned kGnfsMinBits = 128; // ниже SIQS справляется быстрее
-constexpr unsigned kGnfsMaxBits = 150; // предел этой реализации GNFS
+constexpr unsigned kGnfsMaxBits = 150; // практический предел этой реализации GNFS
 constexpr unsigned kSiqsMaxBits = 320; // дальше SIQS идёт сутками
+
+// Способ выбора решета (значение совпадает с индексом в GUI):
+//   0 — авто: SIQS до kSiqsMaxBits, GNFS в полосе kGnfsMinBits..kGnfsMaxBits;
+//   1 — принудительно SIQS: без ограничения по разрядности (пользователь сам
+//       решает, что готов ждать; на 512 битах это, скорее всего, сутки и больше);
+//   2 — принудительно GNFS: тоже без ограничения; выше 150 бит реализация
+//       запускается «как есть» с максимальными параметрами и, вероятнее всего,
+//       не наберёт соотношений (оценка достижимости выводится в статус).
+enum SieveChoice : int {
+    kSieveAuto = 0,
+    kSieveSiqs = 1,
+    kSieveGnfs = 2,
+};
 
 template <typename T>
 std::vector<T> factor_parallel_generic(T n,
                                        std::function<void(const std::string&)> status_cb = nullptr,
                                        ::bignum::StageProfiler* profiler = nullptr,
                                        bool skip_ecm = false,
-                                       bool gnfs_preferred = false) {
+                                       int sieve_method = kSieveAuto) {
     std::vector<T> factors;
 
     if (n <= T(1)) return factors;
@@ -816,8 +832,8 @@ std::vector<T> factor_parallel_generic(T n,
     auto pm1_res = pollard_pm1(n, 50000);
     if (pm1_res.has_value()) {
         T f = *pm1_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -828,25 +844,25 @@ std::vector<T> factor_parallel_generic(T n,
     if (profiler) profiler->start_stage("Pollard-Brent rho");
     T f_rho = ::bignum::generic_ecm::pollard_brent_rho(n, 200000);
     if (f_rho > T(1) && f_rho < n) {
-        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f_rho), status_cb, profiler, skip_ecm);
+        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm, sieve_method);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f_rho), status_cb, profiler, skip_ecm, sieve_method);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
     }
 
     // 5. Быстрый запуск SIQS для чисел <= 135 бит (отрабатывает за доли секунды).
-    //    Исключение — ручной выбор GNFS в полосе 128-150 бит: иначе этот ярлык
-    //    успел бы позаимствовать запуск у GNFS, обойдя стадии 7-9.
+    //    Исключение — явный выбор GNFS: иначе этот ярлык успел бы позаимствовать
+    //    запуск у GNFS, обойдя стадии 7-9.
     const bool in_gnfs_band = n.bit_width() >= kGnfsMinBits && n.bit_width() <= kGnfsMaxBits;
-    if (n.bit_width() <= 135 && !(gnfs_preferred && in_gnfs_band)) {
+    if (n.bit_width() <= 135 && sieve_method != kSieveGnfs) {
         if (status_cb) status_cb("Запуск SIQS (быстрая факторизация)...");
         if (profiler) profiler->start_stage("SIQS (Квадратичное решето)");
         auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
         if (siqs_res.has_value()) {
             T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
             factors.insert(factors.end(), sub1.begin(), sub1.end());
             factors.insert(factors.end(), sub2.begin(), sub2.end());
             return factors;
@@ -855,7 +871,10 @@ std::vector<T> factor_parallel_generic(T n,
 
     // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит.
     // При skip_ecm (полупростые числа) ECM пропускается целиком — сразу решето.
-    if (!skip_ecm && n.bit_width() > 135) {
+    // При явном выборе решета (SIQS/GNFS) лестница ECM тоже не запускается:
+    // пользователь просил конкретный метод, а на 512 битах ECM-план верхних
+    // тиров идёт часами до собственно решета.
+    if (!skip_ecm && sieve_method == kSieveAuto && n.bit_width() > 135) {
         struct EcmStage
         {
             unsigned curves;
@@ -900,11 +919,12 @@ std::vector<T> factor_parallel_generic(T n,
             auto ecm_res = ecm_parallel(n, stage.curves, stage.B1, stage.B2, status_cb);
             if (ecm_res.has_value()) {
                 T f = *ecm_res;
-                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
+                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
                 auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f),
                                                     status_cb,
                                                     profiler,
-                                                    skip_ecm);
+                                                    skip_ecm,
+                                                    sieve_method);
                 factors.insert(factors.end(), sub1.begin(), sub1.end());
                 factors.insert(factors.end(), sub2.begin(), sub2.end());
                 return factors;
@@ -912,39 +932,48 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7-9. Решета. Порядок: SIQS — автоматический основной метод (до 320 бит),
-    //      GNFS — только по ручному запросу и в своей полосе 128-150 бит.
-    //      Замер на 136-битном полупростом: GNFS не укладывался и в 525 с
-    //      (запуск остановлен пользователем), тогда как SIQS справляется за
-    //      секунды — поэтому автоматический конвейер GNFS не выбирает.
-    auto try_gnfs = [&]() -> bool {
+    // 7-9. Решёта. В авторежиме: SIQS — основной метод (до 320 бит), GNFS —
+    //      фолбэк в полосе 128-150 бит. При явном выборе пользователя запускается
+    //      только выбранный метод и БЕЗ ограничения по разрядности (форсированный
+    //      режим: оценка достижимости GNFS выводится в статус, но не отменяет
+    //      запуск). Замер на 136-битном полупростом: SIQS нашёл делитель за 0.2 с,
+    //      GNFS не уложился и в 525 с — поэтому авторежим GNFS не выбирает.
+    auto try_gnfs = [&](bool force) -> bool {
         if (status_cb)
-            status_cb("Запуск GNFS (Общее решето числового поля)...");
+            status_cb(force ? "Запуск GNFS (принудительно, без ограничения разрядности)..."
+                            : "Запуск GNFS (Общее решето числового поля)...");
         if (profiler)
             profiler->start_stage("GNFS (Решето числового поля)");
 
-        auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb);
+        auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb, force);
         if (!gnfs_res.has_value())
             return false;
 
         T f = *gnfs_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
+        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return true;
     };
 
-    // 7. GNFS по ручному запросу — до SIQS (пользователь хочет именно его).
-    if (gnfs_preferred && in_gnfs_band && !::u128::Globals::LoadStop() && try_gnfs())
+    // 7. GNFS по явному выбору пользователя — до SIQS и вне полосы 128-150 бит.
+    if (sieve_method == kSieveGnfs && !::u128::Globals::LoadStop()) {
+        if (try_gnfs(true))
+            return factors;
+        if (status_cb)
+            status_cb("GNFS не нашёл делитель: выбран принудительный GNFS, "
+                      "SIQS не запускается.");
+        if (profiler) profiler->finish();
+        factors.push_back(n);
         return factors;
-    if (gnfs_preferred && !in_gnfs_band && status_cb)
-        status_cb("GNFS недоступен: число вне полосы 128-150 бит — работаю через SIQS...");
+    }
 
-    // 8. SIQS — основной метод для всех чисел до 320 бит (GNFS при отказе
-    //    вернётся ниже фолбэком). Числа крупнее оценка достижимости в gnfs.hpp
-    //    отвергает, а построение факторных баз стоило бы 5-54 с впустую.
-    if (n.bit_width() <= kSiqsMaxBits && !::u128::Globals::LoadStop()) {
+    // 8. SIQS: основной метод авторежима (до kSiqsMaxBits) либо принудительный
+    //    выбор без ограничения по разрядности.
+    const bool siqs_allowed = (sieve_method == kSieveSiqs)
+                              || (sieve_method == kSieveAuto && n.bit_width() <= kSiqsMaxBits);
+    if (siqs_allowed && !::u128::Globals::LoadStop()) {
         if (status_cb)
             status_cb("Запуск SIQS (факторизация через решето)...");
         if (profiler)
@@ -952,17 +981,25 @@ std::vector<T> factor_parallel_generic(T n,
         auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
         if (siqs_res.has_value()) {
             T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm);
+            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
+            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
             factors.insert(factors.end(), sub1.begin(), sub1.end());
             factors.insert(factors.end(), sub2.begin(), sub2.end());
             return factors;
         }
+        if (sieve_method == kSieveSiqs) {
+            if (status_cb)
+                status_cb("SIQS не нашёл делитель: выбран принудительный SIQS, "
+                          "GNFS не запускается.");
+            if (profiler) profiler->finish();
+            factors.push_back(n);
+            return factors;
+        }
     }
 
-    // 9. GNFS фолбэк в полосе 128-150 бит — только если SIQS отказал
-    //    (в ручном режиме GNFS уже пробовался выше).
-    if (!gnfs_preferred && in_gnfs_band && !::u128::Globals::LoadStop() && try_gnfs())
+    // 9. GNFS фолбэк в полосе 128-150 бит — только в авторежиме после отказа SIQS.
+    if (sieve_method == kSieveAuto && in_gnfs_band && !::u128::Globals::LoadStop()
+        && try_gnfs(false))
         return factors;
 
     if (profiler) profiler->finish();

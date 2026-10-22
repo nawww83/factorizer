@@ -190,7 +190,11 @@ FactorizerBackend::FactorizerBackend(QObject *parent)
     QSettings s;
     m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
     m_skipEcm = s.value("Algorithms/skipEcm", false).toBool(); // по умолчанию false
-    m_gnfsPreferred = s.value("Algorithms/gnfsPreferred", false).toBool(); // по умолчанию false
+    // Миграция со старого булева ключа: включённый «GNFS сначала» → режим GNFS.
+    const int migrated = s.value("Algorithms/gnfsPreferred", false).toBool() ? 2 : 0;
+    m_method = s.value("Algorithms/method", migrated).toInt();
+    if (m_method < 0 || m_method > 2)
+        m_method = 0;
 }
 
 FactorizerBackend::~FactorizerBackend() {
@@ -222,13 +226,15 @@ void FactorizerBackend::setSkipEcm(bool val)
     }
 }
 
-void FactorizerBackend::setGnfsPreferred(bool val)
+void FactorizerBackend::setMethod(int val)
 {
-    if (m_gnfsPreferred != val) {
-        m_gnfsPreferred = val;
+    if (val < 0 || val > 2)
+        val = 0;
+    if (m_method != val) {
+        m_method = val;
         QSettings s;
-        s.setValue("Algorithms/gnfsPreferred", val);
-        emit gnfsPreferredChanged();
+        s.setValue("Algorithms/method", val);
+        emit methodChanged();
     }
 }
 
@@ -354,13 +360,19 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     setResult("");
 
     const bool skipEcm = m_skipEcm;
-    const bool gnfsPreferred = m_gnfsPreferred;
+    const int method = m_method;
 
-    // Сразу проговариваем в строке статуса, будет ли вообще применён ECM:
-    // он работает только для чисел от 136 бит (меньшие мгновенно раскладывает
-    // быстрый SIQS) и целиком отключается переключателем «Пропускать ECM».
+    // Сразу проговариваем в строке статуса, какой метод будет применён и будет
+    // ли вообще задействован ECM. ECM работает только в авторежиме для чисел
+    // от 136 бит (меньшие мгновенно раскладывает быстрый SIQS), целиком
+    // отключается переключателем «Пропускать ECM» и не запускается при явном
+    // выборе решета — пользователь просил конкретный метод.
     QString ecmNote;
-    if (skipEcm)
+    if (method == 2)
+        ecmNote = ", метод: GNFS (без ограничения по разрядности)";
+    else if (method == 1)
+        ecmNote = ", метод: SIQS (без ограничения по разрядности)";
+    else if (skipEcm)
         ecmNote = ", ECM отключён (Пропускать ECM)";
     else if (val.bitLength <= 135)
         ecmNote = ", ECM не применяется (≤135 бит — быстрый SIQS)";
@@ -375,7 +387,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     std::string stdStr = numberStr.trimmed().toStdString();
     const int numberBits = static_cast<int>(val.bitLength);
 
-    std::thread([this, stdStr, numberBits, skipEcm, gnfsPreferred]() {
+    std::thread([this, stdStr, numberBits, skipEcm, method]() {
         using namespace bignum::generic_ecm;
         QElapsedTimer timer;
         timer.start();
@@ -383,7 +395,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
         bignum::StageProfiler profiler;
         std::string output = "";
 
-        auto format_result = [this](const auto& factor_res, qint64 elapsedMs, const bignum::StageProfiler& prof) {
+        auto format_result = [this, method](const auto& factor_res, qint64 elapsedMs, const bignum::StageProfiler& prof) {
             std::stringstream ss;
             bool first = true;
 
@@ -404,17 +416,26 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
                 ss << "\n\n(Факторизация остановлена пользователем)\n";
             } else if (!factor_res.completed) {
                 ss << "\n\n(Факторизация не завершена: методы исчерпаны";
-                // Для чисел крупнее практического предела SIQS объясняем причину:
-                // в программе нет метода такой мощности, нужен, например, CADO-NFS.
+                // При явном выборе метода объясняем, что именно не сработало;
+                // в авторежиме для чисел крупнее практического предела SIQS
+                // подсказываем про CADO-NFS.
                 T unfactored(0);
                 if (factor_res.remainder.has_value())
                     unfactored = *factor_res.remainder;
                 else if (!factor_res.factors.empty())
                     unfactored = factor_res.factors.begin()->first;
-                if (unfactored.bit_width() > ::bignum::generic_ecm::kSiqsMaxBits)
+                if (method == 2) {
+                    ss << ": выбран GNFS, делитель не найден (для чисел такого "
+                          "размера эта реализация может не набрать соотношений; "
+                          "нужен, например, CADO-NFS)";
+                } else if (method == 1) {
+                    ss << ": выбран SIQS, делитель не найден (число слишком велико "
+                          "для этого решета; нужен, например, CADO-NFS)";
+                } else if (unfactored.bit_width() > ::bignum::generic_ecm::kSiqsMaxBits) {
                     ss << ": число крупнее " << ::bignum::generic_ecm::kSiqsMaxBits
                        << " бит — для таких размеров в программе нет достаточно "
                           "мощного метода (нужен, например, CADO-NFS)";
+                }
                 ss << ")\n";
             }
 
@@ -439,7 +460,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             auto run = [&](auto tag) {
                 using T = typename decltype(tag)::type;
                 T val = T::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, gnfsPreferred);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, method);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);

@@ -27,6 +27,7 @@ qt_add_executable(appfactorizer
     u128_intrinsics.hpp
     siqs.hpp
     generic_factorizer.hpp
+    cpu_topology.hpp
 )
 
 qt_add_qml_module(appfactorizer

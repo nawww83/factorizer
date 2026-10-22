@@ -50,7 +50,7 @@ ApplicationWindow {
         bitSpin.value = Math.min(Math.max(inputBitLength, bitSpin.from), bitSpin.to);
     }
 
-    // 700: при 520 ряды кнопок и переключателей (включая «GNFS сначала»)
+    // 700: при 520 ряды кнопок и переключателей (включая выбор метода)
     // не помещались и обрезались справа.
     width: 700
     height: 840
@@ -170,9 +170,9 @@ ApplicationWindow {
             SpinBox {
                 id: bitSpin
 
-                // Произвольная разрядность 64..512. Больше 512 бит в программе
-                // нет работающего метода (SIQS ограничен 320 битами, GNFS этой
-                // реализации — 150), поэтому потолок именно 512.
+                // Произвольная разрядность 64..512. Ограничения по разрядности
+                // у методов сняты: при явном выборе SIQS/GNFS расчёт запустится
+                // и на 512 битах (пользователь сам решает, что готов ждать).
                 from: 64
                 to: 512
                 stepSize: 1
@@ -362,40 +362,61 @@ ApplicationWindow {
                 ToolTip.visible: hovered
                 ToolTip.text: "Полностью отключает лестницу ECM (для полупростых p×q:\n"
                               + "сразу работают решёта SIQS/GNFS). Методы Полларда — работают.\n\n"
-                              + "ECM применяется только к числам от 136 бит: меньшие числа\n"
-                              + "мгновенно раскладывает быстрый SIQS, поэтому стадий ECM\n"
-                              + "там нет независимо от этого переключателя."
+                              + "ECM применяется только в режиме «Авто» к числам от 136 бит:\n"
+                              + "меньшие числа мгновенно раскладывает быстрый SIQS.\n"
+                              + "При явном выборе метода (SIQS/GNFS) ECM не запускается и так."
             }
 
-            // Ручной выбор GNFS вместо автоматического SIQS
-            Switch {
-                id: gnfsPreferredSwitch
+            // Явный выбор метода решета: авто / SIQS / GNFS
+            Label {
+                text: "Метод:"
+                color: colTextPrimary
+                font.pixelSize: 13
+                Layout.alignment: Qt.AlignVCenter
+            }
 
-                text: "GNFS сначала"
-                checked: backend.gnfsPreferred
+            ComboBox {
+                id: methodCombo
+
+                model: ["Авто", "SIQS", "GNFS"]
+                currentIndex: backend.method
+                implicitWidth: 118
+                implicitHeight: 28
+                font.pixelSize: 12
                 enabled: !backend.isRunning
-                onToggled: backend.gnfsPreferred = checked
+                Layout.alignment: Qt.AlignVCenter
+                onActivated: backend.method = currentIndex
 
                 contentItem: Text {
-                    text: gnfsPreferredSwitch.text
-                    font: gnfsPreferredSwitch.font
-                    color: gnfsPreferredSwitch.enabled ? colTextPrimary : colTextSecondary
+                    leftPadding: 8
+                    rightPadding: methodCombo.indicator.width + methodCombo.spacing
+                    text: methodCombo.displayText
+                    font: methodCombo.font
+                    color: methodCombo.enabled ? colTextPrimary : colTextSecondary
                     verticalAlignment: Text.AlignVCenter
-                    leftPadding: gnfsPreferredSwitch.indicator.width + gnfsPreferredSwitch.spacing
+                    elide: Text.ElideRight
+                }
+
+                background: Rectangle {
+                    radius: 6
+                    color: window.darkMode ? "#2b2d33" : "#ffffff"
+                    border.width: 1
+                    border.color: methodCombo.enabled
+                                  ? (methodCombo.activeFocus ? colBorderFocus : colBorder)
+                                  : colBorder
                 }
 
                 ToolTip.visible: hovered
-                ToolTip.text: "Запускать GNFS до SIQS для чисел 128-150 бит.\n"
-                              + "Экспериментально: на 136-битном числе SIQS нашёл делитель\n"
-                              + "за 0.2 с, а GNFS не справился и за 925 с (сбой извлечения\n"
-                              + "корня: 0 из 13 векторов ядра дали делитель), поэтому\n"
-                              + "автоматический конвейер его не выбирает.\n"
-                              + "Вне полосы 128-150 бит GNFS всё равно не запускается.\n\n"
-                              + "В диапазоне 128-135 бит флаг отключает ещё и быстрый SIQS\n"
-                              + "(иначе тот перехватил бы запуск у GNFS) — сразу идёт GNFS.\n"
-                              + "ECM при этом не запускается: он работает только от 136 бит,\n"
-                              + "а от 136 бит лестница ECM всё равно идёт раньше GNFS,\n"
-                              + "то есть «сначала» относится к паре SIQS/GNFS."
+                ToolTip.text: "Метод факторизации:\n"
+                              + "• Авто — SIQS до 320 бит, GNFS в полосе 128-150 бит;\n"
+                              + "• SIQS — всегда квадратичное решето, без ограничения разрядности;\n"
+                              + "• GNFS — всегда решето числового поля, без ограничения разрядности.\n\n"
+                              + "При явном выборе работает только выбранный метод (плюс пробное\n"
+                              + "деление, Поллард и проверка простоты): лестница ECM не запускается,\n"
+                              + "фолбэка на другой метод нет.\n\n"
+                              + "Запустить 512-битное число можно любым методом, но это, скорее\n"
+                              + "всего, часы или сутки счёта: GNFS выведет предупреждение оценки\n"
+                              + "достижимости и продолжит работу, SIQS просто будет считать."
             }
 
             Item {

@@ -3,6 +3,7 @@
 #include "u128.hpp"
 #include "ubig.hpp"
 #include "u128_utils.h"
+#include "cpu_topology.hpp"
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -17,6 +18,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <string>
+#include <limits>
 
 namespace bignum::siqs {
 
@@ -465,8 +467,9 @@ public:
 
         // 2. Параллельное просеивание полиномов
         if (status_cb) status_cb("SIQS: Просеивание полиномов (SIQS Gray Code)...");
-        unsigned num_threads = std::thread::hardware_concurrency();
-        if (num_threads == 0) num_threads = 4;
+        // Только P-ядра: E-ядра на гибридных процессорах заметно медленнее.
+        // Потоки дополнительно закрепляются за P-ядрами (см. pin_current_thread).
+        unsigned num_threads = ::bignum::cpu::worker_thread_count();
 
         std::vector<std::thread> workers;
         workers.reserve(num_threads);
@@ -474,8 +477,13 @@ public:
         std::atomic<uint32_t> batch_seed{0};
 
         for (unsigned t = 0; t < num_threads; ++t) {
-            workers.emplace_back([this, &batch_seed, t, status_cb]() {
-                sieve_worker(batch_seed, t, status_cb);
+            const bool wide = m_N.bit_width() > kSieveWideBits;
+            workers.emplace_back([this, &batch_seed, t, status_cb, wide]() {
+                ::bignum::cpu::pin_current_thread(t);
+                if (wide)
+                    sieve_worker<uint16_t>(batch_seed, t, status_cb);
+                else
+                    sieve_worker<uint8_t>(batch_seed, t, status_cb);
             });
         }
 
@@ -535,11 +543,18 @@ private:
         return true;
     }
 
+    // Ширина счётчика решета: 8 бит хватает до ~240 бит (сумма log2(p) по
+    // делителям Q(x) не превышает log2(Q) ~ разрядности числа). Для чисел
+    // крупнее байт переполняется — берём 16-битный счётчик, иначе порог
+    // отсечения становится бессмысленным и кандидатов оказываются миллионы.
+    static constexpr uint32_t kSieveWideBits = 240;
+
+    template <typename Counter>
     void sieve_worker(std::atomic<uint32_t> &batch_seed,
                       unsigned thread_id,
                       std::function<void(const std::string &)> status_cb)
     {
-        std::vector<uint8_t> sieve(2 * m_M, 0);
+        std::vector<Counter> sieve(2 * m_M, 0);
         size_t fb_len = m_FB.size();
 
         // Пропуск малых простых (<= 37) при просеивании
@@ -760,8 +775,14 @@ private:
                 // Оценка максимального значения |Q(x)| на отрезке [-M, M]
                 T max_val = A * T(static_cast<uint64_t>(m_M) * m_M)
                             + B_abs * T(static_cast<uint64_t>(2 * m_M)) + div_q(m_N, A);
-                uint8_t max_bits = static_cast<uint8_t>(max_val.bit_width());
-                uint8_t threshold = (max_bits > allowed_slack) ? (max_bits - allowed_slack) : 1;
+                // max_bits считаем в uint32_t: для 512-битных чисел bit_width()
+                // не влезает в uint8_t и порог обнулялся (кандидатов — все точки).
+                const uint32_t max_bits = max_val.bit_width();
+                const int threshold_i = (max_bits > allowed_slack)
+                                            ? static_cast<int>(max_bits - allowed_slack)
+                                            : 1;
+                const Counter threshold = static_cast<Counter>(
+                    std::min<int>(threshold_i, std::numeric_limits<Counter>::max()));
 
                 // Поиск кандидатов
                 for (int j = 0; j < 2 * m_M; ++j) {

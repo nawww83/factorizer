@@ -14,7 +14,8 @@ class FactorizerBackend : public QObject
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     Q_PROPERTY(QString resultText READ resultText NOTIFY resultTextChanged)
     Q_PROPERTY(bool skipEcm READ skipEcm WRITE setSkipEcm NOTIFY skipEcmChanged)
-    Q_PROPERTY(bool gnfsPreferred READ gnfsPreferred WRITE setGnfsPreferred NOTIFY gnfsPreferredChanged)
+    // Способ факторизации (решето): 0 — авто, 1 — SIQS, 2 — GNFS.
+    Q_PROPERTY(int method READ method WRITE setMethod NOTIFY methodChanged)
 
 public:
     explicit FactorizerBackend(QObject *parent = nullptr);
@@ -32,11 +33,11 @@ public:
     bool skipEcm() const { return m_skipEcm; }
     void setSkipEcm(bool val);
 
-    // Ручной выбор GNFS: запускать решето числового поля до SIQS для чисел
-    // 128-150 бит (экспериментально: обычно эта реализация GNFS медленнее SIQS,
-    // автоматический конвейер его не выбирает)
-    bool gnfsPreferred() const { return m_gnfsPreferred; }
-    void setGnfsPreferred(bool val);
+    // Способ факторизации: 0 — авто (SIQS до 320 бит, GNFS в полосе 128-150),
+    // 1 — принудительно SIQS, 2 — принудительно GNFS. Явный выбор снимает
+    // ограничения по разрядности: пользователь сам решает, что готов ждать.
+    int method() const { return m_method; }
+    void setMethod(int val);
 
     Q_INVOKABLE void startFactorization(const QString &numberStr, int bitWidth);
     Q_INVOKABLE void stop();
@@ -50,7 +51,7 @@ signals:
     void resultTextChanged();
     void darkModeChanged();
     void skipEcmChanged();
-    void gnfsPreferredChanged();
+    void methodChanged();
     void semiprimeReady(const QString &number);
 
 private:
@@ -61,7 +62,7 @@ private:
     bool m_isRunning = false;
     bool m_darkMode = true;
     bool m_skipEcm = false;
-    bool m_gnfsPreferred = false;
+    int m_method = 0; // 0 — авто, 1 — SIQS, 2 — GNFS
     std::atomic<bool> m_userStopped{false};
     QString m_statusText = "Готов к работе";
     QString m_resultText;
