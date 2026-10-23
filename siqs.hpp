@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <iterator>
 #include <string>
+#include <sstream>
+#include <chrono>
 #include <limits>
 
 namespace bignum::siqs {
@@ -390,6 +392,19 @@ class MPQSSolver {
     size_t m_combined_count = 0;
     std::atomic<bool> m_done{false};
 
+    // Параметры полиномов, общие для всех потоков (считаются один раз).
+    uint32_t m_target_a_bits = 0;
+    size_t m_k_primes = 3;
+
+    // Диагностика: сколько значений прошло порог решета и сколько многочленов
+    // просмотрено. По ним видно, «пустое» это решето из-за параметров или из-за
+    // недостижимой вероятности гладкости.
+    std::atomic<uint64_t> m_candidates{0};
+    std::atomic<uint64_t> m_polys_viewed{0};
+    std::atomic<size_t> m_relations_count{0};
+    std::atomic<bool> m_stall_reported{false};
+    std::chrono::steady_clock::time_point m_start_time;
+
 public:
     explicit MPQSSolver(const T& n) : m_N(n) {}
 
@@ -464,6 +479,77 @@ public:
         m_partials.clear();
         m_combined_count = 0;
         m_done.store(false);
+        m_candidates.store(0);
+        m_polys_viewed.store(0);
+        m_relations_count.store(0);
+        m_stall_reported.store(false);
+        m_start_time = std::chrono::steady_clock::now();
+
+        // Целевой размер A: A ~ sqrt(2N)/M. В факторной базе нет простых
+        // длиннее log2(max p), поэтому число простых в A должно быть таким,
+        // чтобы их произведение действительно дотягивало до target_a_bits.
+        // Иначе A получается меньше sqrt(N)/M, Q(x) ~ N/A вместо ~ sqrt(N)*M,
+        // и гладких значений не бывает вовсе (наблюдалось на 512 битах:
+        // A ~ 2^168 вместо 2^236, Q ~ 2^344, ноль соотношений навсегда).
+        const uint32_t m_log2 = static_cast<uint32_t>(std::round(std::log2(m_M)));
+        const uint32_t half_bits = bits / 2;
+        m_target_a_bits = (half_bits > m_log2) ? (half_bits - m_log2) : 20;
+        const uint32_t max_log_p = std::max<uint32_t>(m_FB.back().log_p, 1);
+
+        // Историческая таблица k (она верна, пока простых в базе хватает).
+        size_t k_table = 3;
+        if (m_target_a_bits >= 40)
+            k_table = 4;
+        if (m_target_a_bits >= 60)
+            k_table = 5;
+        if (m_target_a_bits >= 80)
+            k_table = 6;
+        if (m_target_a_bits >= 105)
+            k_table = 7;
+        if (m_target_a_bits >= 130)
+            k_table = 8;
+
+        // Сколько бит реально даёт одно простое: средний log2 у верхней тысячи
+        // простых базы. Если таблицы не хватает, увеличиваем k, иначе A
+        // останется меньше sqrt(N)/M и Q(x) ~ N/A — гладких значений не будет.
+        const size_t top_n = std::min<size_t>(m_FB.size(), 1000);
+        uint64_t top_sum = 0;
+        for (size_t i = m_FB.size() - top_n; i < m_FB.size(); ++i)
+            top_sum += m_FB[i].log_p;
+        const uint32_t top_avg
+            = std::max<uint32_t>(1, static_cast<uint32_t>(top_sum / top_n));
+        // Допуск 4 бита: недостача в пару бит на практике безвредна, а лишнее
+        // простое удваивает число полиномов на одно A.
+        const size_t k_needed
+            = (m_target_a_bits > 4) ? (m_target_a_bits - 4 + top_avg - 1) / top_avg : 3;
+        m_k_primes = std::clamp<size_t>(std::max(k_table, k_needed), 3, 12);
+
+        // Грубая оценка Дикмана: Q(x) ~ 2*sqrt(N)*M, вероятность гладкости
+        // над факторной базой ~ u^-u, где u = log(Q)/log(max p).
+        const double q_bits = static_cast<double>(bits) / 2.0 + 1.0 + m_log2;
+        const double u = q_bits / max_log_p;
+        const double log10_per_value = u * std::log10(std::max(u, 2.0));
+        const double log10_total = log10_per_value
+                                   + std::log10(static_cast<double>(m_num_relations_needed));
+        if (status_cb) {
+            std::ostringstream os;
+            os << "SIQS: A ~ 2^" << m_target_a_bits << " (" << m_k_primes
+               << " простых), Q ~ 2^" << static_cast<int>(std::round(q_bits))
+               << ", гладкость ~1e-" << static_cast<int>(std::round(log10_per_value))
+               << " на значение";
+            status_cb(os.str());
+        }
+        // u >= 9.8 — это уже 360+ бит: даже при идеальных параметрах нужны
+        // недели/годы. До 320 бит (u ~ 9.4) SIQS ещё имеет смысл.
+        if (status_cb && u >= 9.8) {
+            status_cb("SIQS: ВНИМАНИЕ: для " + std::to_string(bits)
+                      + " бит нужно порядка 1e"
+                      + std::to_string(static_cast<int>(std::round(log10_total)))
+                      + " значений Q: даже при 1e9 значений/с это ~1e"
+                      + std::to_string(std::max<int>(
+                            0, static_cast<int>(std::round(log10_total)) - 9))
+                      + " секунд; разумнее GNFS (если он поддержан) или ECM.");
+        }
 
         // 2. Параллельное просеивание полиномов
         if (status_cb) status_cb("SIQS: Просеивание полиномов (SIQS Gray Code)...");
@@ -563,10 +649,10 @@ private:
             sieve_start_idx++;
         }
 
-        // Оптимальный битовый размер A: A ~ sqrt(2N) / M
-        uint32_t half_bits = m_N.bit_width() / 2;
-        uint32_t m_log2 = static_cast<uint32_t>(std::round(std::log2(m_M)));
-        uint32_t target_a_bits = (half_bits > m_log2) ? (half_bits - m_log2) : 20;
+        // Параметры полиномов посчитаны в solve() по фактической факторной базе:
+        // m_k_primes подобрано так, чтобы произведение простых дотягивало до
+        // m_target_a_bits (см. комментарий там).
+        const size_t k_primes = m_k_primes;
 
         // Запас для порога: log2(L_max) + 24 бита на пропущенные p <= 37 и вариацию Q(x)
         uint8_t l_max_bits = (m_L_max > 0) ? static_cast<uint8_t>(std::round(std::log2(m_L_max)))
@@ -578,7 +664,20 @@ private:
         std::vector<uint32_t> root1(fb_len, 0);
         std::vector<uint32_t> root2(fb_len, 0);
         std::vector<bool> is_in_a(fb_len, false);
-        std::vector<std::vector<uint32_t>> deltas;
+        std::vector<std::vector<uint32_t>> deltas(k_primes,
+                                                  std::vector<uint32_t>(fb_len, 0));
+
+        // Целевой битовый размер одного простого множителя A и окно индексов
+        // в факторной базе. Считается один раз на весь запуск.
+        uint32_t prime_target_bits = m_target_a_bits / static_cast<uint32_t>(k_primes);
+        if (prime_target_bits < 10)
+            prime_target_bits = 10;
+        size_t p_min_idx = sieve_start_idx;
+        while (p_min_idx < fb_len && m_FB[p_min_idx].log_p < prime_target_bits)
+            p_min_idx++;
+        if (p_min_idx >= fb_len)
+            p_min_idx = fb_len - std::max<size_t>(1, fb_len / 8);
+        size_t p_max_idx = std::min(fb_len, p_min_idx + fb_len / 3 + 40);
 
         std::vector<uint32_t> p_indices;
         std::vector<uint16_t> p_powers;
@@ -586,42 +685,12 @@ private:
         p_powers.reserve(64);
 
         std::mt19937_64 rng(thread_id * 10007 + 1);
+        auto last_report = std::chrono::steady_clock::now();
 
         while (!m_done.load(std::memory_order_relaxed) && !::u128::Globals::LoadStop()) {
-            uint32_t b_id = batch_seed.fetch_add(1);
-
-            // 1. Корректный подбор числа простых k_primes для Carrier Polynomials
-            size_t k_primes = 3;
-            if (target_a_bits >= 40)
-                k_primes = 4;
-            if (target_a_bits >= 60)
-                k_primes = 5;
-            if (target_a_bits >= 80)
-                k_primes = 6;
-            if (target_a_bits >= 105)
-                k_primes = 7;
-            if (target_a_bits >= 130)
-                k_primes = 8;
-
-            // Вычисляем целевой битовый размер одного простого множителя
-            uint32_t prime_target_bits = target_a_bits / k_primes;
-            if (prime_target_bits < 10)
-                prime_target_bits = 10;
-
-            size_t p_min_idx = sieve_start_idx;
-            while (p_min_idx < fb_len && m_FB[p_min_idx].log_p < prime_target_bits) {
-                p_min_idx++;
-            }
-
-            // Гарантируем, что диапазон не выродится и содержит минимум 40 кандидатов
-            if (p_min_idx < fb_len / 10 || p_min_idx >= fb_len * 3 / 4) {
-                p_min_idx = fb_len / 8;
-            }
-            size_t p_max_idx = std::min(fb_len, p_min_idx + fb_len / 3 + 40);
-            if (p_max_idx <= p_min_idx) {
-                p_min_idx = sieve_start_idx;
-                p_max_idx = fb_len;
-            }
+            // Общий счётчик пачек: работа потокам не адресуется, значение нужно
+            // только для отладочной идентификации пачки.
+            [[maybe_unused]] uint32_t b_id = batch_seed.fetch_add(1);
 
             std::vector<size_t> a_indices;
             a_indices.reserve(k_primes);
@@ -631,9 +700,14 @@ private:
             size_t attempts = 0;
             while (a_indices.size() < k_primes && attempts < 300) {
                 attempts++;
-                // Если попыток много, автоматически расширяем окно на всю середину базы
-                size_t cur_min = (attempts > 100) ? (fb_len / 10) : p_min_idx;
-                size_t cur_max = (attempts > 100) ? (fb_len * 4 / 5) : p_max_idx;
+                // Если попыток много, автоматически расширяем окно вниз по базе
+                size_t cur_min = p_min_idx;
+                size_t cur_max = p_max_idx;
+                if (attempts > 100) {
+                    cur_min = std::max<size_t>(sieve_start_idx, fb_len / 10);
+                    cur_max = std::max<size_t>(cur_min + 1, fb_len * 4 / 5);
+                }
+                cur_max = std::min(cur_max, fb_len);
 
                 size_t p_idx = cur_min + (rng() % (cur_max - cur_min));
                 if (!is_in_a[p_idx]) {
@@ -660,7 +734,8 @@ private:
             }
 
             // 3. Предвычисление инверсий A^-1 mod p и шагов deltas[j][p]
-            deltas.assign(k_primes, std::vector<uint32_t>(fb_len, 0));
+            // deltas выделены один раз: нужные ячейки перезаписываются ниже,
+            // а для простых из A они всё равно не читаются (is_in_a).
             for (size_t i = sieve_start_idx; i < fb_len; ++i) {
                 if (is_in_a[i])
                     continue;
@@ -703,6 +778,42 @@ private:
             for (size_t g = 0; g < num_gray_polys; ++g) {
                 if (m_done.load(std::memory_order_relaxed) || ::u128::Globals::LoadStop())
                     return;
+
+                // Прогресс и диагностика — по времени, а не по пачкам: при k=11
+                // одна пачка это 1024 полинома (около минуты на 512 битах).
+                if (thread_id == 0 && status_cb) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last_report >= std::chrono::seconds(5)) {
+                        last_report = now;
+                        status_cb("SIQS: Полиномов: "
+                                  + std::to_string(m_polys_viewed.load())
+                                  + " | Соотношений: "
+                                  + std::to_string(m_relations_count.load()) + " / "
+                                  + std::to_string(m_num_relations_needed)
+                                  + " | Кандидатов: " + std::to_string(m_candidates.load()));
+                    }
+                    // «Вечный ноль»: раньше при неверных параметрах решето молча
+                    // крутилось сутками. Через 30 с сообщаем причину (один раз).
+                    if (!m_stall_reported.load() && m_relations_count.load() == 0
+                        && now - m_start_time > std::chrono::seconds(30)) {
+                        m_stall_reported.store(true);
+                        const uint64_t cand = m_candidates.load();
+                        if (cand == 0) {
+                            status_cb("SIQS: за 30 с (полиномов: "
+                                      + std::to_string(m_polys_viewed.load())
+                                      + ") ни одно значение не прошло порог "
+                                        "(0 соотношений): либо параметры решета не "
+                                        "соответствуют числу, либо вероятность гладкости "
+                                        "исчезающе мала — счёт в таком режиме "
+                                        "бессмысленен.");
+                        } else {
+                            status_cb("SIQS: за 30 с 0 соотношений из "
+                                      + std::to_string(cand)
+                                      + " кандидатов: вероятность гладкости слишком "
+                                        "низка для факторной базы этого размера.");
+                        }
+                    }
+                }
 
                 if (g > 0) {
                     uint32_t prev_gray = (g - 1) ^ ((g - 1) >> 1);
@@ -785,8 +896,10 @@ private:
                     std::min<int>(threshold_i, std::numeric_limits<Counter>::max()));
 
                 // Поиск кандидатов
+                m_polys_viewed.fetch_add(1, std::memory_order_relaxed);
                 for (int j = 0; j < 2 * m_M; ++j) {
                     if (sieve[j] >= threshold) {
+                        m_candidates.fetch_add(1, std::memory_order_relaxed);
                         int64_t x_val = j - m_M;
 
                         // Вычисление Y = Ax + B
@@ -950,6 +1063,8 @@ private:
                                 rel.prime_pow = std::move(final_powers);
                                 rel.large_prime = 1;
                                 m_relations.push_back(std::move(rel));
+                                m_relations_count.store(m_relations.size(),
+                                                        std::memory_order_relaxed);
                                 if (status_cb
                                     && (m_relations.size() % 10 == 0
                                         || m_relations.size()
@@ -1023,6 +1138,8 @@ private:
                                     }
                                     m_relations.push_back(std::move(combined));
                                     m_combined_count++;
+                                    m_relations_count.store(m_relations.size(),
+                                                            std::memory_order_relaxed);
                                     if (status_cb
                                         && (m_relations.size() % 10 == 0
                                             || m_relations.size() >= static_cast<size_t>(
@@ -1043,11 +1160,6 @@ private:
                         }
                     }
                 }
-            }
-            if (b_id % 5 == 0 && thread_id == 0 && status_cb) {
-                status_cb("SIQS: Пачек полиномов: " + std::to_string(b_id)
-                          + " | Соотношений: " + std::to_string(m_relations.size()) + " / "
-                          + std::to_string(m_num_relations_needed));
             }
         }
     }
