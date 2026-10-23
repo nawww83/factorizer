@@ -250,6 +250,13 @@ void FactorizerBackend::setStatus(const QString &s) {
     emit statusTextChanged();
 }
 
+void FactorizerBackend::setWarning(const QString &w) {
+    if (m_warningText != w) {
+        m_warningText = w;
+        emit warningTextChanged();
+    }
+}
+
 void FactorizerBackend::setResult(const QString &r) {
     m_resultText = r;
     emit resultTextChanged();
@@ -284,6 +291,7 @@ void FactorizerBackend::generateSemiprime(int bitWidth) {
 
     setRunning(true);
     setStatus(QString("Генерация полупростого числа: p×q (%1 бит)...").arg(bitWidth));
+    setWarning(QString());
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
@@ -380,6 +388,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     setStatus(QString("Выполняется факторизация (%1 бит)%2...")
                   .arg(val.bitLength)
                   .arg(ecmNote));
+    setWarning(QString());
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
@@ -447,7 +456,14 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
         auto update_ui_status = [this](const std::string& msg) {
             if (!m_userStopped.load()) {
                 QMetaObject::invokeMethod(this, [this, msg]() {
-                    setStatus(QString::fromStdString(msg));
+                    const QString text = QString::fromStdString(msg);
+                    // Соглашение: диагностика, которую нельзя потерять, содержит
+                    // слово «ВНИМАНИЕ». Прогресс затирает statusText, но не строку
+                    // предупреждения — иначе оценки сложности на 512 битах
+                    // исчезали бы через 5 секунд.
+                    if (text.contains(QStringLiteral("ВНИМАНИЕ")))
+                        setWarning(text);
+                    setStatus(text);
                 });
             }
         };

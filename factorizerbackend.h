@@ -12,6 +12,9 @@ class FactorizerBackend : public QObject
     Q_PROPERTY(bool darkMode READ isDarkMode WRITE setDarkMode NOTIFY darkModeChanged)
     Q_PROPERTY(bool isRunning READ isRunning NOTIFY isRunningChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+    // Предупреждение о неприменимости выбранного метода (например, SIQS на
+    // 512 битах). В отличие от statusText, не затирается прогрессом.
+    Q_PROPERTY(QString warningText READ warningText NOTIFY warningTextChanged)
     Q_PROPERTY(QString resultText READ resultText NOTIFY resultTextChanged)
     Q_PROPERTY(bool skipEcm READ skipEcm WRITE setSkipEcm NOTIFY skipEcmChanged)
     // Способ факторизации (решето): 0 — авто, 1 — SIQS, 2 — GNFS.
@@ -23,6 +26,7 @@ public:
 
     bool isRunning() const { return m_isRunning; }
     QString statusText() const { return m_statusText; }
+    QString warningText() const { return m_warningText; }
     QString resultText() const { return m_resultText; }
 
     bool isDarkMode() const;
@@ -48,6 +52,7 @@ public:
 signals:
     void isRunningChanged();
     void statusTextChanged();
+    void warningTextChanged();
     void resultTextChanged();
     void darkModeChanged();
     void skipEcmChanged();
@@ -57,6 +62,7 @@ signals:
 private:
     void setRunning(bool running);
     void setStatus(const QString &status);
+    void setWarning(const QString &warning);
     void setResult(const QString &res);
 
     bool m_isRunning = false;
@@ -65,5 +71,6 @@ private:
     int m_method = 0; // 0 — авто, 1 — SIQS, 2 — GNFS
     std::atomic<bool> m_userStopped{false};
     QString m_statusText = "Готов к работе";
+    QString m_warningText;
     QString m_resultText;
 };

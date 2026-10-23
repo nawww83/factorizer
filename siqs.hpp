@@ -799,7 +799,7 @@ private:
                         m_stall_reported.store(true);
                         const uint64_t cand = m_candidates.load();
                         if (cand == 0) {
-                            status_cb("SIQS: за 30 с (полиномов: "
+                            status_cb("SIQS: ВНИМАНИЕ: за 30 с (полиномов: "
                                       + std::to_string(m_polys_viewed.load())
                                       + ") ни одно значение не прошло порог "
                                         "(0 соотношений): либо параметры решета не "
@@ -807,7 +807,7 @@ private:
                                         "исчезающе мала — счёт в таком режиме "
                                         "бессмысленен.");
                         } else {
-                            status_cb("SIQS: за 30 с 0 соотношений из "
+                            status_cb("SIQS: ВНИМАНИЕ: за 30 с 0 соотношений из "
                                       + std::to_string(cand)
                                       + " кандидатов: вероятность гладкости слишком "
                                         "низка для факторной базы этого размера.");

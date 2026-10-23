@@ -19,6 +19,7 @@ ApplicationWindow {
     readonly property color colBadgeBg: darkMode ? "#1f334d" : "#e3f2fd"
     readonly property color colBadgeBorder: darkMode ? "#2b5687" : "#90caf9"
     readonly property color colBadgeText: darkMode ? "#70b5ff" : "#1565c0"
+    readonly property color colWarning: darkMode ? "#ffb74d" : "#b26a00"
     readonly property int inputBitLength: backend.getBitLength(sanitizeNumber(inputField.text))
 
     function sanitizeNumber(str) {
@@ -530,6 +531,17 @@ ApplicationWindow {
                 verticalAlignment: Text.AlignVCenter
             }
 
+        }
+
+        // Постоянное предупреждение о неприменимости метода: строка статуса
+        // обновляется прогрессом, а эта — нет (см. warningText в бэкенде).
+        Label {
+            Layout.fillWidth: true
+            visible: backend.warningText.length > 0
+            text: backend.warningText
+            color: colWarning
+            font.pixelSize: 12
+            wrapMode: Text.WordWrap
         }
 
         // --- 6. Заголовок результата с кнопкой Копировать ---
