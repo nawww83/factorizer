@@ -437,13 +437,14 @@ inline MontgomeryPoint<T> montgomery_add(const MontgomeryPoint<T>& P,
 
 // --- Решето простых для Stage 2 ---
 inline std::vector<uint8_t> make_prime_sieve(uint32_t max_val) {
-    std::vector<uint8_t> is_prime(max_val + 1, 1);
-    if (max_val >= 0) is_prime[0] = 0;
+    std::vector<uint8_t> is_prime(static_cast<size_t>(max_val) + 1, 1);
+    is_prime[0] = 0;
     if (max_val >= 1) is_prime[1] = 0;
     for (uint32_t p = 2; 1ULL * p * p <= max_val; ++p) {
         if (is_prime[p]) {
-            for (uint32_t i = p * p; i <= max_val; i += p) {
-                is_prime[i] = 0;
+            // 64-битный индекс исключает переполнение i += p у верхней границы диапазона.
+            for (uint64_t i = 1ULL * p * p; i <= max_val; i += p) {
+                is_prime[static_cast<size_t>(i)] = 0;
             }
         }
     }
