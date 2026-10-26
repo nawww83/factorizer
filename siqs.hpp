@@ -175,7 +175,7 @@ template<typename T>
 inline constexpr std::pair<T, T> div_rem(const T &a, const T &b)
 {
     // 1. Проверяем, возвращает ли a / b структуру с полями first и second
-    // (Это покрывает UBig::DivResult, U128::DivResult и ULOW::operator/, возвращающий std::pair)
+    // (Это покрывает UBig::DivResult и U128::DivResult)
     if constexpr (requires {
                       { (a / b).first } -> std::convertible_to<T>;
                       { (a / b).second } -> std::convertible_to<T>;
