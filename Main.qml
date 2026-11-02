@@ -172,7 +172,7 @@ ApplicationWindow {
                 id: bitSpin
 
                 // Произвольная разрядность 64..512. Ограничения по разрядности
-                // у методов сняты: при явном выборе SIQS/GNFS расчёт запустится
+                // у методов сняты: при явном выборе SIQS расчёт запустится
                 // и на 512 битах (пользователь сам решает, что готов ждать).
                 from: 64
                 to: 512
@@ -362,13 +362,13 @@ ApplicationWindow {
 
                 ToolTip.visible: hovered
                 ToolTip.text: "Полностью отключает лестницу ECM (для полупростых p×q:\n"
-                              + "сразу работают решёта SIQS/GNFS). Методы Полларда — работают.\n\n"
+                              + "сразу работает решето SIQS). Методы Полларда — работают.\n\n"
                               + "ECM применяется только в режиме «Авто» к числам от 136 бит:\n"
-                              + "меньшие числа мгновенно раскладывает быстрый SIQS.\n"
-                              + "При явном выборе метода (SIQS/GNFS) ECM не запускается и так."
+                              + "меньшие числа мгновенно раскладывает решето SIQS.\n"
+                              + "При явном выборе метода ECM не запускается и так."
             }
 
-            // Явный выбор метода решета: авто / SIQS / GNFS
+            // Явный выбор метода решета: авто / SIQS
             Label {
                 text: "Метод:"
                 color: colTextPrimary
@@ -379,7 +379,7 @@ ApplicationWindow {
             ComboBox {
                 id: methodCombo
 
-                model: ["Авто", "SIQS", "GNFS"]
+                model: ["Авто", "SIQS"]
                 currentIndex: backend.method
                 implicitWidth: 118
                 implicitHeight: 28
@@ -409,16 +409,14 @@ ApplicationWindow {
 
                 ToolTip.visible: hovered
                 ToolTip.text: "Метод факторизации:\n"
-                              + "• Авто — SIQS до 320 бит, GNFS в полосе 128-150 бит;\n"
-                              + "• SIQS — всегда квадратичное решето, без ограничения разрядности;\n"
-                              + "• GNFS — всегда решето числового поля, без ограничения разрядности.\n\n"
+                              + "• Авто — решето SIQS до 320 бит, ECM-лестница для чисел крупнее;\n"
+                              + "• SIQS — всегда квадратичное решето, без ограничения разрядности.\n\n"
                               + "При явном выборе работает только выбранный метод (плюс пробное\n"
                               + "деление, Поллард и проверка простоты): лестница ECM не запускается,\n"
                               + "фолбэка на другой метод нет.\n\n"
                               + "Запустить 512-битное число можно любым методом, но SIQS выше ~350 бит\n"
-                              + "практически не набирает соотношений (программа сразу выведет оценку\n"
-                              + "сложности и предупреждение), а GNFS этой реализации рассчитан\n"
-                              + "примерно до 150 бит."
+                              + "практически не набирает соотношений (программа выведет оценку\n"
+                              + "сложности и предупреждение). Жёсткий предел реализации — 512 бит."
             }
 
             Item {
@@ -531,6 +529,46 @@ ApplicationWindow {
                 verticalAlignment: Text.AlignVCenter
             }
 
+            Label {
+                // Процент дублируем числом: полоса бывает слишком короткой,
+                // чтобы оценить долю на глаз.
+                visible: progressBar.visible
+                text: Math.round(backend.progress * 100) + " %"
+                font.family: "Monospace"
+                font.pixelSize: 11
+                color: colTextSecondary
+                verticalAlignment: Text.AlignVCenter
+            }
+
+        }
+
+        // Индикатор прогресса текущей факторизации. Значение монотонно растёт
+        // (см. FactorizerBackend::setProgress), поэтому полоса не «дёргается»
+        // назад при переходе к подзадачам.
+        ProgressBar {
+            id: progressBar
+
+            Layout.fillWidth: true
+            Layout.preferredHeight: 6
+            visible: backend.isRunning || (backend.progress > 0 && backend.progress < 1)
+            from: 0
+            to: 1
+            value: backend.progress
+
+            background: Rectangle {
+                implicitHeight: 6
+                radius: 3
+                color: window.darkMode ? "#2b2d33" : "#e2e5ea"
+            }
+
+            contentItem: Item {
+                Rectangle {
+                    width: progressBar.visualPosition * parent.width
+                    height: parent.height
+                    radius: 3
+                    color: colBorderFocus
+                }
+            }
         }
 
         // Постоянное предупреждение о неприменимости метода: строка статуса

@@ -21,11 +21,10 @@ qt_add_executable(appfactorizer
 
     # Заголовочные файлы:
     factorizerbackend.h
-    u128.hpp
-    ubig.hpp
+    bignum.hpp
     u128_utils.h
     u128_intrinsics.hpp
-    siqs.hpp
+    siqs_xor.hpp
     generic_factorizer.hpp
     cpu_topology.hpp
 )
@@ -38,8 +37,7 @@ qt_add_qml_module(appfactorizer
         factorizerbackend.h
         factorizerbackend.cpp
         generic_factorizer.hpp
-        siqs.hpp
-        gnfs.hpp
+        siqs_xor.hpp
 )
 
 target_link_libraries(appfactorizer PRIVATE

@@ -28,18 +28,11 @@ template <typename T>
 T get_random_full() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
 
-    if constexpr (std::is_same_v<T, ::bignum::u128::U128>) {
-        uint64_t lo = rng();
-        uint64_t hi = rng() | (1ULL << 63);
-        return ::bignum::u128::U128(lo, hi);
-    } else if constexpr (requires { typename T::half_type; }) {
-        using Half = typename T::half_type;
-        Half hi = get_random_full<Half>();
-        Half lo = get_random_full<Half>();
-        return T(hi, lo);
-    } else {
-        return T(rng());
-    }
+    T v(0);
+    for (uint32_t i = 0; i < T::WORDS; ++i)
+        v.w[i] = rng();
+    v.w[T::WORDS - 1] |= (1ULL << 63);
+    return v;
 }
 
 // Случайное число с ровно bits битами (bits <= 0 — полная ширина типа T).
@@ -49,7 +42,7 @@ T get_random_full() {
 template <typename T>
 T get_random_value(int bits = 0) {
     T v = get_random_full<T>();
-    const unsigned full = v.bit_width(); // == sizeof(T)*8
+    const unsigned full = T::BITS;
     if (bits <= 0 || static_cast<unsigned>(bits) >= full)
         return v;
     v >>= (full - static_cast<unsigned>(bits));
@@ -76,16 +69,16 @@ FactorResult<T> build_factor_result(const std::vector<T>& raw_factors, const T& 
                 for (int i = 0; i < p; ++i) prod = prod * f;
             }
             if (prod > T(0) && prod < original_val) {
-                res.remainder = ::bignum::siqs::div_q(original_val, prod);
+                res.remainder = ::bignum::ops::div_q(original_val, prod);
             }
         }
     } else {
         // Конвейер возвращает исходное число без разложения и в том случае,
-        // когда все методы исчерпаны (например, полупростое 512 бит: SIQS
-        // ограничен 320 битами, GNFS этой реализации — 150). Раньше такой
-        // результат помечался completed и выглядел в UI как «простой множитель».
-        // Теперь: если число составное — это честный остаток с пометкой,
-        // а если простое — разложение тривиально и всё корректно.
+        // когда все методы исчерпаны (например, полупростое 512 бит: решето
+        // ограничено 320 битами в авторежиме). Раньше такой результат помечался
+        // completed и выглядел в UI как «простой множитель». Теперь: если число
+        // составное — это честный остаток с пометкой, а если простое —
+        // разложение тривиально и всё корректно.
         const bool single = res.factors.size() == 1 && res.factors.count(original_val) == 1;
         if (single && !::bignum::generic_ecm::is_prime_generic(original_val, 25)) {
             res.completed = false;
@@ -190,10 +183,8 @@ FactorizerBackend::FactorizerBackend(QObject *parent)
     QSettings s;
     m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
     m_skipEcm = s.value("Algorithms/skipEcm", false).toBool(); // по умолчанию false
-    // Миграция со старого булева ключа: включённый «GNFS сначала» → режим GNFS.
-    const int migrated = s.value("Algorithms/gnfsPreferred", false).toBool() ? 2 : 0;
-    m_method = s.value("Algorithms/method", migrated).toInt();
-    if (m_method < 0 || m_method > 2)
+    m_method = s.value("Algorithms/method", 0).toInt();
+    if (m_method < 0 || m_method > 1)
         m_method = 0;
 }
 
@@ -228,7 +219,7 @@ void FactorizerBackend::setSkipEcm(bool val)
 
 void FactorizerBackend::setMethod(int val)
 {
-    if (val < 0 || val > 2)
+    if (val < 0 || val > 1)
         val = 0;
     if (m_method != val) {
         m_method = val;
@@ -260,6 +251,18 @@ void FactorizerBackend::setWarning(const QString &w) {
 void FactorizerBackend::setResult(const QString &r) {
     m_resultText = r;
     emit resultTextChanged();
+}
+
+void FactorizerBackend::setProgress(double p) {
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+    // Монотонность: подзадачи (рекурсивные вызовы конвейера) сообщают свою
+    // локальную долю, которая может оказаться меньше уже показанной, — назад
+    // индикатор не откатывается.
+    if (p <= m_progress)
+        return;
+    m_progress = p;
+    emit progressChanged();
 }
 
 QString FactorizerBackend::generateRandomNumber(int bitWidth) {
@@ -372,18 +375,16 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
 
     // Сразу проговариваем в строке статуса, какой метод будет применён и будет
     // ли вообще задействован ECM. ECM работает только в авторежиме для чисел
-    // от 136 бит (меньшие мгновенно раскладывает быстрый SIQS), целиком
-    // отключается переключателем «Пропускать ECM» и не запускается при явном
-    // выборе решета — пользователь просил конкретный метод.
+    // от 136 бит (меньшие мгновенно раскладывает решето), целиком отключается
+    // переключателем «Пропускать ECM» и не запускается при явном выборе
+    // решета — пользователь просил конкретный метод.
     QString ecmNote;
-    if (method == 2)
-        ecmNote = ", метод: GNFS (без ограничения по разрядности)";
-    else if (method == 1)
+    if (method == 1)
         ecmNote = ", метод: SIQS (без ограничения по разрядности)";
     else if (skipEcm)
         ecmNote = ", ECM отключён (Пропускать ECM)";
     else if (val.bitLength <= 135)
-        ecmNote = ", ECM не применяется (≤135 бит — быстрый SIQS)";
+        ecmNote = ", ECM не применяется (≤135 бит — решето SIQS)";
 
     setStatus(QString("Выполняется факторизация (%1 бит)%2...")
                   .arg(val.bitLength)
@@ -392,6 +393,13 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
 
     m_userStopped.store(false);
     ::u128::Globals::SetStop(false);
+
+    // Новый запуск — полоса прогресса с нуля (setProgress монотонен и сам
+    // меньшее значение не примет).
+    if (m_progress != 0.0) {
+        m_progress = 0.0;
+        emit progressChanged();
+    }
 
     std::string stdStr = numberStr.trimmed().toStdString();
     const int numberBits = static_cast<int>(val.bitLength);
@@ -433,13 +441,10 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
                     unfactored = *factor_res.remainder;
                 else if (!factor_res.factors.empty())
                     unfactored = factor_res.factors.begin()->first;
-                if (method == 2) {
-                    ss << ": выбран GNFS, делитель не найден (для чисел такого "
-                          "размера эта реализация может не набрать соотношений; "
-                          "нужен, например, CADO-NFS)";
-                } else if (method == 1) {
+                if (method == 1) {
                     ss << ": выбран SIQS, делитель не найден (число слишком велико "
-                          "для этого решета; нужен, например, CADO-NFS)";
+                          "или решето не набрало соотношений; нужен, например, "
+                          "CADO-NFS)";
                 } else if (unfactored.bit_width() > ::bignum::generic_ecm::kSiqsMaxBits) {
                     ss << ": число крупнее " << ::bignum::generic_ecm::kSiqsMaxBits
                        << " бит — для таких размеров в программе нет достаточно "
@@ -468,6 +473,12 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             }
         };
 
+        auto progress_cb = [this](double fraction, const std::string &) {
+            if (m_userStopped.load())
+                return;
+            QMetaObject::invokeMethod(this, [this, fraction]() { setProgress(fraction); });
+        };
+
         try {
             // Тип бигинта выбираем по фактической битности числа, а не по
             // выбранной в UI разрядности: теперь она произвольная (64..512),
@@ -476,7 +487,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             auto run = [&](auto tag) {
                 using T = typename decltype(tag)::type;
                 T val = T::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, method);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, method, progress_cb);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);
@@ -503,6 +514,8 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
         QMetaObject::invokeMethod(this, [this, output]() {
             setResult(QString::fromStdString(output));
             setStatus(m_userStopped.load() ? "Остановлено пользователем" : "Завершено");
+            if (!m_userStopped.load())
+                setProgress(1.0);
             setRunning(false);
         });
     }).detach();

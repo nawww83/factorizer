@@ -16,8 +16,11 @@ class FactorizerBackend : public QObject
     // 512 битах). В отличие от statusText, не затирается прогрессом.
     Q_PROPERTY(QString warningText READ warningText NOTIFY warningTextChanged)
     Q_PROPERTY(QString resultText READ resultText NOTIFY resultTextChanged)
+    // Доля выполненной работы 0..1 для индикатора прогресса. Монотонно
+    // неубывающая внутри одного запуска (см. setProgress).
+    Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
     Q_PROPERTY(bool skipEcm READ skipEcm WRITE setSkipEcm NOTIFY skipEcmChanged)
-    // Способ факторизации (решето): 0 — авто, 1 — SIQS, 2 — GNFS.
+    // Способ факторизации (решето): 0 — авто, 1 — принудительно SIQS.
     Q_PROPERTY(int method READ method WRITE setMethod NOTIFY methodChanged)
 
 public:
@@ -28,6 +31,7 @@ public:
     QString statusText() const { return m_statusText; }
     QString warningText() const { return m_warningText; }
     QString resultText() const { return m_resultText; }
+    double progress() const { return m_progress; }
 
     bool isDarkMode() const;
     void setDarkMode(bool val);
@@ -37,9 +41,9 @@ public:
     bool skipEcm() const { return m_skipEcm; }
     void setSkipEcm(bool val);
 
-    // Способ факторизации: 0 — авто (SIQS до 320 бит, GNFS в полосе 128-150),
-    // 1 — принудительно SIQS, 2 — принудительно GNFS. Явный выбор снимает
-    // ограничения по разрядности: пользователь сам решает, что готов ждать.
+    // Способ факторизации: 0 — авто (решето SIQS до 320 бит + ECM-лестница),
+    // 1 — принудительно SIQS. Явный выбор снимает ограничение по разрядности:
+    // пользователь сам решает, что готов ждать (жёсткий предел — 512 бит).
     int method() const { return m_method; }
     void setMethod(int val);
 
@@ -54,6 +58,7 @@ signals:
     void statusTextChanged();
     void warningTextChanged();
     void resultTextChanged();
+    void progressChanged();
     void darkModeChanged();
     void skipEcmChanged();
     void methodChanged();
@@ -64,13 +69,16 @@ private:
     void setStatus(const QString &status);
     void setWarning(const QString &warning);
     void setResult(const QString &res);
+    // Монотонное обновление прогресса (0..1): назад индикатор не идёт.
+    void setProgress(double p);
 
     bool m_isRunning = false;
     bool m_darkMode = true;
     bool m_skipEcm = false;
-    int m_method = 0; // 0 — авто, 1 — SIQS, 2 — GNFS
+    int m_method = 0; // 0 — авто, 1 — принудительно SIQS
     std::atomic<bool> m_userStopped{false};
     QString m_statusText = "Готов к работе";
     QString m_warningText;
     QString m_resultText;
+    double m_progress = 0.0;
 };

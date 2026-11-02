@@ -72,3 +72,7 @@ Testing/
 
 # Qt Creator user-local settings
 CMakeLists.txt.user
+
+# Python
+__pycache__/
+*.pyc

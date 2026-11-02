@@ -1,7 +1,7 @@
 #pragma once
 
-#include "gnfs.hpp"
-#include "siqs.hpp"
+#include "bignum.hpp"
+#include "siqs_xor.hpp"
 #include "u128_utils.h"
 #include "cpu_topology.hpp"
 
@@ -9,6 +9,7 @@
 #include <string>
 #include <functional>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <optional>
 #include <algorithm>
@@ -73,84 +74,6 @@ private:
     }
 };
 
-template <typename T>
-class BarrettReducer {
-    using DoubleT = bignum::UBig<T>;
-
-    T m_mod;
-    DoubleT m_mu;
-    uint32_t m_k = 0;
-
-public:
-    BarrettReducer() = default;
-
-    explicit BarrettReducer(const T& mod) : m_mod(mod) {
-        if (mod <= T(3)) return;
-        m_k = mod.bit_width();
-
-        // mu = floor(2^(2k) / mod) вычисляем через деление 2^(2k - 1) / mod.
-        // Сдвиг (2k - 1) строго меньше размера DoubleT и физически не вызывает переполнения:
-        // для U128 это 255 < 256, для U512 это 1023 < 1024, для U2048 это 4095 < 4096.
-        DoubleT half_pow = DoubleT(1) << (2 * m_k - 1);
-        auto [q0, r0] = bignum::siqs::div_rem(half_pow, DoubleT(mod));
-
-        DoubleT r_double = r0 << 1;
-        DoubleT mod_double = DoubleT(mod);
-        if (r_double >= mod_double) {
-            m_mu = (q0 << 1) + DoubleT(1);
-        } else {
-            m_mu = q0 << 1;
-        }
-
-        // Проверка корректности редукции
-        T a = mod - T(2);
-        T b = mod - T(3);
-        T test_mul = mul(a, b);
-        T test_sqr = sqr(mod - T(1));
-
-        if (test_mul != T(6) || test_sqr != T(1)) {
-            std::abort();
-        }
-    }
-
-    const T& modulus() const { return m_mod; }
-
-    inline T mul(const T& x, const T& y) const {
-        DoubleT z = DoubleT::mult_ext(x, y);
-        return reduce(z);
-    }
-
-    inline T sqr(const T& x) const {
-        DoubleT z = DoubleT::square_ext(x);
-        return reduce(z);
-    }
-
-    inline T reduce(const DoubleT& z) const {
-        if (z < DoubleT(m_mod)) {
-            return ::u128::utils::get_lo(z);
-        }
-
-        // 1. q1 = z >> (k + 1)
-        DoubleT q1 = z >> (m_k + 1);
-
-        // 2. q2 = (q1 * mu) >> (k - 1)
-        // Произведение (q1 * mu) строго < 2^(2k - 2) и гарантированно помещается в DoubleT
-        DoubleT q1_mu = q1 * m_mu;
-        DoubleT q2 = q1_mu >> (m_k - 1);
-
-        // 3. r = z - q2 * m_mod
-        DoubleT prod = q2 * DoubleT(m_mod);
-        DoubleT r_wide = (z >= prod) ? (z - prod) : DoubleT(0);
-
-        // Финальная коррекция: оценка частного ошибается не более чем на 5 единиц
-        while (r_wide >= DoubleT(m_mod)) {
-            r_wide = r_wide - DoubleT(m_mod);
-        }
-
-        return ::u128::utils::get_lo(r_wide);
-    }
-};
-
 } // namespace bignum
 
 namespace bignum::generic_ecm {
@@ -179,10 +102,10 @@ template <typename T>
 bool miller_test_generic(T d, const T& n) {
     static thread_local std::mt19937_64 rng(1337);
     T a = T(rng()) ^ (T(rng()) << 64);
-    a = ::bignum::siqs::div_r(a, n - T(4)) + T(2); // a in [2, n - 2]
+    a = ::bignum::ops::div_r(a, n - T(4)) + T(2); // a in [2, n - 2]
 
     T x = a;
-    ::bignum::siqs::int_power_mod(x, d, n);
+    ::bignum::ops::int_power_mod(x, d, n);
 
     if (x == T(1) || x == (n - T(1))) {
         return true;
@@ -190,7 +113,7 @@ bool miller_test_generic(T d, const T& n) {
 
     T n_minus_1 = n - T(1);
     while (d != n_minus_1) {
-        ::bignum::siqs::square_mod(x, n);
+        ::bignum::ops::square_mod(x, n);
         d = d << 1;
 
         if (x == T(1)) {
@@ -249,7 +172,7 @@ T pollard_brent_rho(const T& n, uint64_t max_steps = 200000) {
         for (uint64_t i = 0; i < r; ++i) {
             if ((i & 0x3FF) == 0 && ::u128::Globals::LoadStop())
                 return T(1);
-            ::bignum::siqs::square_mod(y, n);
+            ::bignum::ops::square_mod(y, n);
             y = mod_add(y, c, n);
         }
 
@@ -258,13 +181,13 @@ T pollard_brent_rho(const T& n, uint64_t max_steps = 200000) {
             ys = y;
             uint64_t limit = std::min(static_cast<uint64_t>(128), r - k);
             for (uint64_t i = 0; i < limit; ++i) {
-                ::bignum::siqs::square_mod(y, n);
+                ::bignum::ops::square_mod(y, n);
                 y = mod_add(y, c, n);
                 T diff = (x >= y) ? (x - y) : (y - x);
-                ::bignum::siqs::mult_mod(q, diff, n);
+                ::bignum::ops::mult_mod(q, diff, n);
             }
 
-            g = ::bignum::siqs::gcd_generic(q, n);
+            g = ::bignum::ops::gcd(q, n);
             k += limit;
             steps += limit;
         }
@@ -276,10 +199,10 @@ T pollard_brent_rho(const T& n, uint64_t max_steps = 200000) {
         do {
             if (::u128::Globals::LoadStop())
                 return T(1);
-            ::bignum::siqs::square_mod(ys, n);
+            ::bignum::ops::square_mod(ys, n);
             ys = mod_add(ys, c, n);
             T diff = (x >= ys) ? (x - ys) : (ys - x);
-            g = ::bignum::siqs::gcd_generic(diff, n);
+            g = ::bignum::ops::gcd(diff, n);
         } while (g == T(1));
     }
 
@@ -305,10 +228,10 @@ std::optional<T> pollard_pm1(const T& n, uint32_t B1 = 100000) {
             p_pow *= p;
         }
 
-        ::bignum::siqs::int_power_mod(a, T(p_pow), n);
+        ::bignum::ops::int_power_mod(a, T(p_pow), n);
 
         T diff = (a > T(1)) ? (a - T(1)) : (n - T(1));
-        T g = ::bignum::siqs::gcd_generic(diff, n);
+        T g = ::bignum::ops::gcd(diff, n);
         if (g > T(1) && g < n) {
             return g;
         }
@@ -337,7 +260,7 @@ inline T mod_double(const T& a, const T& m) {
 template <typename T>
 std::optional<T> inv_mod_binary(const T& a_in, const T& m) {
     if (m <= T(1)) return std::nullopt;
-    T a = ::bignum::siqs::div_r(a_in, m);
+    T a = ::bignum::ops::div_r(a_in, m);
     if (a == T(0)) return std::nullopt;
 
     T u = a;
@@ -391,7 +314,7 @@ std::optional<T> inv_mod_binary(const T& a_in, const T& m) {
 template <typename T>
 inline MontgomeryPoint<T> montgomery_double(const MontgomeryPoint<T>& P,
                                             const T& A24,
-                                            const BarrettReducer<T>& br) {
+                                            const BarrettReducer<T::BITS>& br) {
     const T& n = br.modulus();
     T u = mod_add(P.X, P.Z, n);
     T v = mod_sub(P.X, P.Z, n);
@@ -414,7 +337,7 @@ template <typename T>
 inline MontgomeryPoint<T> montgomery_add(const MontgomeryPoint<T>& P,
                                          const MontgomeryPoint<T>& Q,
                                          const T& x_diff,
-                                         const BarrettReducer<T>& br) {
+                                         const BarrettReducer<T::BITS>& br) {
     const T& n = br.modulus();
     T u1 = mod_add(P.X, P.Z, n);
     T v1 = mod_sub(P.X, P.Z, n);
@@ -456,7 +379,7 @@ template <typename T>
 MontgomeryPoint<T> montgomery_multiply(uint32_t k,
                                        const MontgomeryPoint<T>& P,
                                        const T& A24,
-                                       const BarrettReducer<T>& br) {
+                                       const BarrettReducer<T::BITS>& br) {
     MontgomeryPoint<T> R0 = P;
     MontgomeryPoint<T> R1 = montgomery_double(P, A24, br);
 
@@ -477,7 +400,7 @@ MontgomeryPoint<T> montgomery_multiply(uint32_t k,
 template <typename T>
 std::optional<T> ecm_stage2(MontgomeryPoint<T>& Q,
                             const T& A24,
-                            const BarrettReducer<T>& br,
+                            const BarrettReducer<T::BITS>& br,
                             uint32_t B1,
                             uint32_t B2,
                             const std::vector<uint8_t>& is_prime_table) {
@@ -496,7 +419,7 @@ std::optional<T> ecm_stage2(MontgomeryPoint<T>& Q,
         if (j == 1) continue;
         baby[j] = montgomery_multiply(j, Q, A24, br);
         if (baby[j].Z == T(0)) {
-            T g = ::bignum::siqs::gcd_generic(baby[j].X, n);
+            T g = ::bignum::ops::gcd(baby[j].X, n);
             if (g > T(1) && g < n) return g;
             return std::nullopt;
         }
@@ -508,7 +431,7 @@ std::optional<T> ecm_stage2(MontgomeryPoint<T>& Q,
 
     auto g1_z_inv = inv_mod_binary(G1.Z, n);
     if (!g1_z_inv.has_value()) {
-        T g = ::bignum::siqs::gcd_generic(G1.Z, n);
+        T g = ::bignum::ops::gcd(G1.Z, n);
         if (g > T(1) && g < n) return g;
         return std::nullopt;
     }
@@ -550,7 +473,7 @@ std::optional<T> ecm_stage2(MontgomeryPoint<T>& Q,
         }
 
         if (acc_count >= 128) {
-            T g = ::bignum::siqs::gcd_generic(acc, n);
+            T g = ::bignum::ops::gcd(acc, n);
             if (g > T(1) && g < n) return g;
             if (g == n) return std::nullopt;
             acc = T(1);
@@ -565,7 +488,7 @@ std::optional<T> ecm_stage2(MontgomeryPoint<T>& Q,
     }
 
     if (acc_count > 0) {
-        T g = ::bignum::siqs::gcd_generic(acc, n);
+        T g = ::bignum::ops::gcd(acc, n);
         if (g > T(1) && g < n) return g;
     }
 
@@ -577,7 +500,7 @@ template <typename T>
 std::optional<T> ecm_one_curve(const T& n, uint64_t seed, uint32_t B1, uint32_t B2,
                                const std::vector<unsigned>& primes,
                                const std::vector<uint8_t>& is_prime_table) {
-    BarrettReducer<T> br(n); // Редуктор Барретта создается один раз на кривую
+    BarrettReducer<T::BITS> br(n); // Редуктор Барретта создается один раз на кривую
 
     uint64_t sigma_val = (seed % 1000000000ULL) + 6;
     T sigma(sigma_val);
@@ -591,7 +514,7 @@ std::optional<T> ecm_one_curve(const T& n, uint64_t seed, uint32_t B1, uint32_t 
 
     auto v3_inv = inv_mod_binary(v3, n);
     if (!v3_inv.has_value()) {
-        T g = ::bignum::siqs::gcd_generic(v3, n);
+        T g = ::bignum::ops::gcd(v3, n);
         if (g > T(1) && g < n) return g;
         return std::nullopt;
     }
@@ -609,7 +532,7 @@ std::optional<T> ecm_one_curve(const T& n, uint64_t seed, uint32_t B1, uint32_t 
 
     auto denom_inv = inv_mod_binary(denom, n);
     if (!denom_inv.has_value()) {
-        T g = ::bignum::siqs::gcd_generic(denom, n);
+        T g = ::bignum::ops::gcd(denom, n);
         if (g > T(1) && g < n) return g;
         return std::nullopt;
     }
@@ -633,7 +556,7 @@ std::optional<T> ecm_one_curve(const T& n, uint64_t seed, uint32_t B1, uint32_t 
 
             auto z_inv = inv_mod_binary(P.Z, n);
             if (!z_inv.has_value()) {
-                T g = ::bignum::siqs::gcd_generic(P.Z, n);
+                T g = ::bignum::ops::gcd(P.Z, n);
                 if (g > T(1) && g < n) return g;
                 return std::nullopt;
             }
@@ -652,7 +575,7 @@ std::optional<T> ecm_one_curve(const T& n, uint64_t seed, uint32_t B1, uint32_t 
 
         auto z_inv = inv_mod_binary(P.Z, n);
         if (!z_inv.has_value()) {
-            T g = ::bignum::siqs::gcd_generic(P.Z, n);
+            T g = ::bignum::ops::gcd(P.Z, n);
             if (g > T(1) && g < n) return g;
             return std::nullopt;
         }
@@ -729,34 +652,27 @@ std::optional<T> ecm_parallel(const T& n,
 
 // --- 4. Главный конвейер факторизации ---
 // skip_ecm = true: лестница ECM пропускается (удобно для полупростых чисел p×q —
-// после методов Полларда сразу запускаются решета SIQS/GNFS).
+// после методов Полларда сразу запускается решето).
 //
-// Реальные рабочие диапазоны тяжёлых методов (замеры на полупростых p×q):
-//  - GNFS этой реализации собирает соотношения примерно до 150 бит включительно;
-//    выше оценка достижимости честно отказывает (200 бит: ожидается 496 строк
-//    против 22362 нужных, 320 бит — 0.46 против 41658). Классический кроссовер
-//    GNFS/SIQS ≈ 320 бит относится к полноценному NFS (решётчатое решётко, базы
-//    2^25..2^30, разреженная матрица), а не к линейному решету отсюда, поэтому
-//    в конвейере GNFS работает только в своей рабочей полосе, а SIQS остаётся
-//    основным методом для 200-320 бит.
-//  - SIQS: 200 бит — ~3 с, 256 бит — ~30 мин, 288 бит — ~3 ч, 320 бит — ~70 ч;
-//    выше 320 бит его тоже не запускаем (сутки и более на число — не результат).
-constexpr unsigned kGnfsMinBits = 128; // ниже SIQS справляется быстрее
-constexpr unsigned kGnfsMaxBits = 150; // практический предел этой реализации GNFS
-constexpr unsigned kSiqsMaxBits = 320; // дальше SIQS идёт сутками
+// Решето — это новый 2LP-SIQS (siqs_xor.hpp). Замеры на полупростых p×q:
+//  - 100 бит: ~3 с; 205 бит: ~4 с на 8 потоках; 262 бита: единицы минут.
+//  - Реализация работает на 512-битной арифметике, поэтому числа длиннее
+//    512 бит ею не раскладываются (для них остаются ECM и методы Полларда).
+//  - В авторежиме решето запускается до kSieveMaxBits (320 бит): выше время
+//    растёт очень быстро, и сутки на число — не результат.
+constexpr unsigned kSieveMaxBits = 320;      // авторежим
+constexpr unsigned kSieveHardMaxBits = 512;  // жёсткий предел реализации
+constexpr unsigned kSiqsMaxBits = kSieveMaxBits; // совместимость с UI-сообщениями
 
 // Способ выбора решета (значение совпадает с индексом в GUI):
-//   0 — авто: SIQS до kSiqsMaxBits, GNFS в полосе kGnfsMinBits..kGnfsMaxBits;
-//   1 — принудительно SIQS: без ограничения по разрядности (пользователь сам
-//       решает, что готов ждать; выше ~360 бит решето практически не набирает
-//       соотношений — параметры и оценка сложности выводятся в статус);
-//   2 — принудительно GNFS: тоже без ограничения; выше 150 бит реализация
-//       запускается «как есть» с максимальными параметрами и, вероятнее всего,
-//       не наберёт соотношений (оценка достижимости выводится в статус).
+//   0 — авто: решето до kSieveMaxBits, ECM-лестница для чисел крупнее 135 бит;
+//   1 — принудительно решето: без ограничения по разрядности (пользователь сам
+//       решает, что готов ждать; выше 512 бит метод неприменим).
 enum SieveChoice : int {
     kSieveAuto = 0,
-    kSieveSiqs = 1,
-    kSieveGnfs = 2,
+    kSieveForced = 1,
+    // Устаревшее имя, оставлено для совместимости исходников.
+    kSieveSiqs = kSieveForced,
 };
 
 template <typename T>
@@ -764,10 +680,20 @@ std::vector<T> factor_parallel_generic(T n,
                                        std::function<void(const std::string&)> status_cb = nullptr,
                                        ::bignum::StageProfiler* profiler = nullptr,
                                        bool skip_ecm = false,
-                                       int sieve_method = kSieveAuto) {
+                                       int sieve_method = kSieveAuto,
+                                       std::function<void(double, const std::string&)> progress_cb = nullptr) {
     std::vector<T> factors;
 
+    // Единая точка отчёта о прогрессе: доля 0..1 от всей факторизации + фаза.
+    // Вызывается из рабочих потоков; получатель обязан быть потокобезопасным.
+    auto progress = [&](double fraction, const std::string& stage) {
+        if (progress_cb)
+            progress_cb(fraction, stage);
+    };
+
     if (n <= T(1)) return factors;
+
+    progress(0.01, "подготовка");
 
     // 0. Мгновенное снятие степеней двойки битовыми сдвигами
     if ((n & T(1)) == T(0)) {
@@ -788,13 +714,20 @@ std::vector<T> factor_parallel_generic(T n,
         status_cb("Пробное деление...");
     if (profiler)
         profiler->start_stage("Пробное деление (до 65536)");
+    progress(0.02, "пробное деление");
 
     auto small_primes = ::u128::utils::primes(65536);
+    size_t prime_idx = 0;
     for (unsigned p : small_primes) {
         if (p == 2)
             continue;
         if (::u128::Globals::LoadStop())
             return factors;
+        // Прогресс пробного деления: 2%..6% по доле перебранных простых.
+        if ((++prime_idx & 1023) == 0 && !small_primes.empty())
+            progress(0.02 + 0.04 * (static_cast<double>(prime_idx)
+                                    / static_cast<double>(small_primes.size())),
+                     "пробное деление");
 
         // Безопасное сравнение без умножения в типе T:
         // если n уложилось в uint64_t и p * p > n, дальше простых делителей быть не может
@@ -804,12 +737,12 @@ std::vector<T> factor_parallel_generic(T n,
                 break;
         }
 
-        if (::bignum::siqs::rem_u32(n, p) == 0) {
+        if (::bignum::ops::rem_u32(n, p) == 0) {
             T P_val(p);
             do {
                 factors.push_back(P_val);
-                n = ::bignum::siqs::div_by_u32(n, p);
-            } while (::bignum::siqs::rem_u32(n, p) == 0);
+                n = ::bignum::ops::div_by_u32(n, p);
+            } while (::bignum::ops::rem_u32(n, p) == 0);
 
             if (n == T(1))
                 break;
@@ -822,6 +755,7 @@ std::vector<T> factor_parallel_generic(T n,
     }
 
     // 2. Проверка на простоту перед тяжелыми методами
+    progress(0.06, "проверка простоты");
     if (is_prime_generic(n)) {
         factors.push_back(n);
         if (profiler) profiler->finish();
@@ -831,11 +765,12 @@ std::vector<T> factor_parallel_generic(T n,
     // 3. Pollard p - 1 (быстрый этап)
     if (status_cb) status_cb("Pollard p - 1...");
     if (profiler) profiler->start_stage("Pollard p - 1");
+    progress(0.08, "Pollard p - 1");
     auto pm1_res = pollard_pm1(n, 50000);
     if (pm1_res.has_value()) {
         T f = *pm1_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -844,38 +779,66 @@ std::vector<T> factor_parallel_generic(T n,
     // 4. Pollard-Brent rho (для делителей < 45 бит)
     if (status_cb) status_cb("Pollard-Brent rho...");
     if (profiler) profiler->start_stage("Pollard-Brent rho");
+    progress(0.11, "Pollard-Brent rho");
     T f_rho = ::bignum::generic_ecm::pollard_brent_rho(n, 200000);
     if (f_rho > T(1) && f_rho < n) {
-        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm, sieve_method);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f_rho), status_cb, profiler, skip_ecm, sieve_method);
+        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f_rho), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
     }
 
-    // 5. Быстрый запуск SIQS для чисел <= 135 бит (отрабатывает за доли секунды).
-    //    Исключение — явный выбор GNFS: иначе этот ярлык успел бы позаимствовать
-    //    запуск у GNFS, обойдя стадии 7-9.
-    const bool in_gnfs_band = n.bit_width() >= kGnfsMinBits && n.bit_width() <= kGnfsMaxBits;
-    if (n.bit_width() <= 135 && sieve_method != kSieveGnfs) {
-        if (status_cb) status_cb("Запуск SIQS (быстрая факторизация)...");
-        if (profiler) profiler->start_stage("SIQS (Квадратичное решето)");
-        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
-        if (siqs_res.has_value()) {
-            T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
-            factors.insert(factors.end(), sub1.begin(), sub1.end());
-            factors.insert(factors.end(), sub2.begin(), sub2.end());
-            return factors;
+    // 5. Решето как единая точка входа: пробуем 2LP-SIQS (siqs_xor.hpp).
+    //    Возвращает true, если делитель найден и обе части уже разложены —
+    //    тогда факторизация завершена. Проверка предела разрядности здесь же:
+    //    реализация работает на 512-битной арифметике.
+    const uint32_t n_bits = n.bit_width();
+    auto try_sieve = [&](bool force) -> bool {
+        if (n_bits > kSieveHardMaxBits) {
+            if (status_cb)
+                status_cb("SIQS пропущен: " + std::to_string(n_bits) + " бит превышает предел "
+                          + std::to_string(kSieveHardMaxBits) + " бит.");
+            return false;
         }
+
+        if (status_cb)
+            status_cb(force ? "Запуск SIQS (принудительно, без ограничения разрядности)..."
+                            : "Запуск SIQS (квадратичное решето)...");
+        if (profiler)
+            profiler->start_stage("SIQS (Квадратичное решето)");
+
+        // Локальный прогресс решета (0..1) отображается в полосу 14%..96%.
+        auto sieve_progress = [&](double local, const std::string &stage) {
+            progress(0.14 + 0.82 * local, stage);
+        };
+        auto sieve_res = ::bignum::siqs_xor::factor(n, status_cb, sieve_progress);
+        if (!sieve_res.has_value())
+            return false;
+
+        T f = *sieve_res;
+        if (f <= T(1) || f >= n)
+            return false;
+
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        factors.insert(factors.end(), sub1.begin(), sub1.end());
+        factors.insert(factors.end(), sub2.begin(), sub2.end());
+        return true;
+    };
+
+    // Быстрый прогон для небольших чисел (<= 135 бит): доли секунды, и ECM-лестница
+    // для них всё равно не запускается.
+    if (sieve_method == kSieveAuto && n_bits <= 135) {
+        if (try_sieve(false))
+            return factors;
     }
 
     // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит.
     // При skip_ecm (полупростые числа) ECM пропускается целиком — сразу решето.
-    // При явном выборе решета (SIQS/GNFS) лестница ECM тоже не запускается:
-    // пользователь просил конкретный метод, а на 512 битах ECM-план верхних
-    // тиров идёт часами до собственно решета.
+    // При явном выборе решета лестница ECM тоже не запускается: пользователь
+    // просил конкретный метод, а на 512 битах ECM-план верхних тиров идёт часами
+    // до собственно решета.
     if (!skip_ecm && sieve_method == kSieveAuto && n.bit_width() > 135) {
         struct EcmStage
         {
@@ -918,15 +881,20 @@ std::vector<T> factor_parallel_generic(T n,
             if (profiler)
                 profiler->start_stage(stage_name);
 
+            progress(0.14 + 0.30 * (static_cast<double>(&stage - ecm_plan.data())
+                                    / static_cast<double>(ecm_plan.size())),
+                     stage_name);
+
             auto ecm_res = ecm_parallel(n, stage.curves, stage.B1, stage.B2, status_cb);
             if (ecm_res.has_value()) {
                 T f = *ecm_res;
-                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
-                auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f),
+                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+                auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f),
                                                     status_cb,
                                                     profiler,
                                                     skip_ecm,
-                                                    sieve_method);
+                                                    sieve_method,
+                                                    progress_cb);
                 factors.insert(factors.end(), sub1.begin(), sub1.end());
                 factors.insert(factors.end(), sub2.begin(), sub2.end());
                 return factors;
@@ -934,75 +902,25 @@ std::vector<T> factor_parallel_generic(T n,
         }
     }
 
-    // 7-9. Решёта. В авторежиме: SIQS — основной метод (до 320 бит), GNFS —
-    //      фолбэк в полосе 128-150 бит. При явном выборе пользователя запускается
-    //      только выбранный метод и БЕЗ ограничения по разрядности (форсированный
-    //      режим: оценка достижимости GNFS выводится в статус, но не отменяет
-    //      запуск). Замер на 136-битном полупростом: SIQS нашёл делитель за 0.2 с,
-    //      GNFS не уложился и в 525 с — поэтому авторежим GNFS не выбирает.
-    auto try_gnfs = [&](bool force) -> bool {
-        if (status_cb)
-            status_cb(force ? "Запуск GNFS (принудительно, без ограничения разрядности)..."
-                            : "Запуск GNFS (Общее решето числового поля)...");
-        if (profiler)
-            profiler->start_stage("GNFS (Решето числового поля)");
-
-        auto gnfs_res = ::bignum::gnfs::number_field_sieve(n, status_cb, force);
-        if (!gnfs_res.has_value())
-            return false;
-
-        T f = *gnfs_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
-        auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
-        factors.insert(factors.end(), sub1.begin(), sub1.end());
-        factors.insert(factors.end(), sub2.begin(), sub2.end());
-        return true;
-    };
-
-    // 7. GNFS по явному выбору пользователя — до SIQS и вне полосы 128-150 бит.
-    if (sieve_method == kSieveGnfs && !::u128::Globals::LoadStop()) {
-        if (try_gnfs(true))
+    // 7. Решето по явному выбору пользователя — без ограничения по разрядности
+    //    (выше kSieveHardMaxBits метод неприменим, это проверяется в try_sieve).
+    if (sieve_method == kSieveForced && !::u128::Globals::LoadStop()) {
+        if (try_sieve(true))
             return factors;
         if (status_cb)
-            status_cb("GNFS не нашёл делитель: выбран принудительный GNFS, "
-                      "SIQS не запускается.");
+            status_cb("SIQS не нашёл делитель: выбран принудительный SIQS, "
+                      "другие решёта не запускаются.");
         if (profiler) profiler->finish();
         factors.push_back(n);
         return factors;
     }
 
-    // 8. SIQS: основной метод авторежима (до kSiqsMaxBits) либо принудительный
-    //    выбор без ограничения по разрядности.
-    const bool siqs_allowed = (sieve_method == kSieveSiqs)
-                              || (sieve_method == kSieveAuto && n.bit_width() <= kSiqsMaxBits);
-    if (siqs_allowed && !::u128::Globals::LoadStop()) {
-        if (status_cb)
-            status_cb("Запуск SIQS (факторизация через решето)...");
-        if (profiler)
-            profiler->start_stage("SIQS (Квадратичное решето)");
-        auto siqs_res = ::bignum::siqs::quadratic_sieve(n, status_cb);
-        if (siqs_res.has_value()) {
-            T f = *siqs_res;
-            auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method);
-            auto sub2 = factor_parallel_generic(::bignum::siqs::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method);
-            factors.insert(factors.end(), sub1.begin(), sub1.end());
-            factors.insert(factors.end(), sub2.begin(), sub2.end());
+    // 8. Решето в авторежиме — до kSieveMaxBits: выше время растёт слишком быстро.
+    const bool sieve_allowed = (sieve_method == kSieveAuto && n_bits <= kSieveMaxBits);
+    if (sieve_allowed && !::u128::Globals::LoadStop()) {
+        if (try_sieve(false))
             return factors;
-        }
-        if (sieve_method == kSieveSiqs) {
-            if (status_cb)
-                status_cb("SIQS не нашёл делитель: выбран принудительный SIQS, "
-                          "GNFS не запускается.");
-            if (profiler) profiler->finish();
-            factors.push_back(n);
-            return factors;
-        }
     }
-
-    // 9. GNFS фолбэк в полосе 128-150 бит — только в авторежиме после отказа SIQS.
-    if (sieve_method == kSieveAuto && in_gnfs_band && !::u128::Globals::LoadStop()
-        && try_gnfs(false))
-        return factors;
 
     if (profiler) profiler->finish();
     factors.push_back(n);
@@ -1088,7 +1006,7 @@ T generate_semiprime(unsigned bitWidth,
             if (cand <= T(sp))
                 return false; // малое число — дальше решает Миллер—Рабин
 
-            if (::bignum::siqs::rem_u32(cand, sp) == 0)
+            if (::bignum::ops::rem_u32(cand, sp) == 0)
                 return true; // делится — составное
         }
         return false;
