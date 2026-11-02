@@ -1483,6 +1483,46 @@ u32 find_best_multiplier_cpp(const U512 &M, const std::vector<u32> &small_primes
     return best_k;
 }
 
+struct AutoParams {
+    u32 prime_bound;
+    int block_bits;
+    int num_a_factors;
+};
+
+AutoParams auto_tune_siqs(const U512& M) {
+    int bits = M.bit_length();
+    double ln_M = bits * 0.6931471805599453; // bits * ln(2)
+    double ln_ln_M = std::log(ln_M);
+    
+    // 1. Аппроксимация L_M[1/2, c] со степенной поправкой под 2LP SIQS.
+    // Коэффициенты откалиброваны по эталонным прогонам:
+    // 205 бит -> ~380k, 232 бита -> ~600k, 245 бит -> ~1.1M, 262 бита -> ~1.6M.
+    double exponent = 0.357 * std::sqrt(ln_M * ln_ln_M) + 3.3;
+    double raw_bound = std::exp(exponent);
+    
+    // Округляем до удобных десятков тысяч
+    u32 prime_bound = (u32)(std::round(raw_bound / 10000.0) * 10000.0);
+    prime_bound = std::max(50000U, std::min(prime_bound, 8000000U));
+
+    // 2. Размер блока: держим в пределах L1/L2 кэша процессора (64-128 КБ)
+    int block_bits = 16;
+    if (bits >= 200) block_bits = 17; // 128 КБ массив (отлично помещается в L2)
+    if (bits >= 270) block_bits = 18; // 256 КБ массив
+
+    // 3. Расчет количества простых множителей s для коэффициента A
+    // target_A ≈ sqrt(2 * M) / (B_size / 2)
+    double half_B = (double)(1U << (block_bits - 1));
+    double log2_target_A = 0.5 * (bits + 1.0) - std::log2(half_B);
+    
+    // Среднее простое из пула A выбирается около p ≈ prime_bound^0.65
+    double log2_avg_q = std::log2((double)prime_bound) * 0.62;
+    int s = (int)std::round(log2_target_A / log2_avg_q);
+    s = std::max(5, std::min(s, 10));
+
+    return {prime_bound, block_bits, s};
+}
+
+
 void factor_siqs_cpp(const std::string &dec_M, u32 prime_bound, int block_bits, int num_a_factors)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -1651,17 +1691,33 @@ void factor_siqs_cpp(const std::string &dec_M, u32 prime_bound, int block_bits, 
     }
 }
 
+void factor_siqs_auto(const std::string& dec_M) {
+    U512 M = from_dec_string(dec_M);
+    AutoParams p = auto_tune_siqs(M);
+    std::cout << "[Автоподбор] Бит: " << M.bit_length()
+              << " -> prime_bound = " << p.prime_bound
+              << ", block_bits = " << p.block_bits
+              << ", num_a_factors = " << p.num_a_factors << "\n";
+    
+    factor_siqs_cpp(dec_M, p.prime_bound, p.block_bits, p.num_a_factors);
+}
+
+
+
 int main()
 {
-    // 1. Ваше 205-битное число (в Python было 22.15 сек)
-    factor_siqs_cpp("33801295533024112192430315909773114733482083162238224697211891", 380000, 17, 7);
+    // 205-битное число (в Python было 22.15 сек)
+    // factor_siqs_cpp("33801295533024112192430315909773114733482083162238224697211891", 380000, 17, 7);
 
-    // 2. Ваше 232-битное число (в Python было 98.6 сек)
-    factor_siqs_cpp("5911987939788655955220092655904964287465054776969341694771422110974013", 600000, 17, 8);
+    // 232-битное число (в Python было 98.6 сек)
+    // factor_siqs_cpp("5911987939788655955220092655904964287465054776969341694771422110974013", 600000, 17, 8);
 
-    // 3. Ваше 245-битное число (74 знака! В Python было 272.2 сек):
+    // 245-битное число (74 знака. В Python было 272.2 сек):
     // 5183690555951629707790497436756762363 * 5864810964374268616720755200996315407
-    factor_siqs_cpp("30401364784979048844780572496488416288730829724034373452010539392784830241", 1100000, 17, 8);
+    // factor_siqs_cpp("30401364784979048844780572496488416288730829724034373452010539392784830241", 1100000, 17, 8);
+
+    std::string M_262 = "5995806622530429600530984275000092882631332762476331275490451238005952121568939";    
+    factor_siqs_auto(M_262);
 
     return 0;
 }
