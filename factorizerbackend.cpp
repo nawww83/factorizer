@@ -182,7 +182,6 @@ FactorizerBackend::FactorizerBackend(QObject *parent)
 {
     QSettings s;
     m_darkMode = s.value("UI/darkMode", true).toBool(); // по умолчанию true
-    m_skipEcm = s.value("Algorithms/skipEcm", false).toBool(); // по умолчанию false
     m_method = s.value("Algorithms/method", 0).toInt();
     if (m_method < 0 || m_method > 1)
         m_method = 0;
@@ -204,16 +203,6 @@ void FactorizerBackend::setDarkMode(bool val)
         QSettings s;
         s.setValue("UI/darkMode", val);
         emit darkModeChanged();
-    }
-}
-
-void FactorizerBackend::setSkipEcm(bool val)
-{
-    if (m_skipEcm != val) {
-        m_skipEcm = val;
-        QSettings s;
-        s.setValue("Algorithms/skipEcm", val);
-        emit skipEcmChanged();
     }
 }
 
@@ -370,21 +359,20 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     setRunning(true);
     setResult("");
 
-    const bool skipEcm = m_skipEcm;
     const int method = m_method;
 
     // Сразу проговариваем в строке статуса, какой метод будет применён и будет
-    // ли вообще задействован ECM. ECM работает только в авторежиме для чисел
-    // от 136 бит (меньшие мгновенно раскладывает решето), целиком отключается
-    // переключателем «Пропускать ECM» и не запускается при явном выборе
-    // решета — пользователь просил конкретный метод.
+    // ли вообще задействован ECM. ECM-лестница включается только в авторежиме и
+    // только для чисел крупнее kSieveMaxBits (320 бит) — там, где решето уже не
+    // запускается; при явном выборе решета её нет, как и для всего, что решето
+    // осиливает.
     QString ecmNote;
     if (method == 1)
         ecmNote = ", метод: SIQS (без ограничения по разрядности)";
-    else if (skipEcm)
-        ecmNote = ", ECM отключён (Пропускать ECM)";
-    else if (val.bitLength <= 135)
-        ecmNote = ", ECM не применяется (≤135 бит — решето SIQS)";
+    else if (val.bitLength <= ::bignum::generic_ecm::kSieveMaxBits)
+        ecmNote = ", ECM не применяется (решето SIQS)";
+    else
+        ecmNote = ", метод: ECM + Поллард (решето SIQS не применяется)";
 
     setStatus(QString("Выполняется факторизация (%1 бит)%2...")
                   .arg(val.bitLength)
@@ -404,7 +392,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
     std::string stdStr = numberStr.trimmed().toStdString();
     const int numberBits = static_cast<int>(val.bitLength);
 
-    std::thread([this, stdStr, numberBits, skipEcm, method]() {
+    std::thread([this, stdStr, numberBits, method]() {
         using namespace bignum::generic_ecm;
         QElapsedTimer timer;
         timer.start();
@@ -487,7 +475,7 @@ void FactorizerBackend::startFactorization(const QString &numberStr, int bitWidt
             auto run = [&](auto tag) {
                 using T = typename decltype(tag)::type;
                 T val = T::fromString(stdStr);
-                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, skipEcm, method, progress_cb);
+                auto raw_factors = factor_parallel_generic(val, update_ui_status, &profiler, method, progress_cb);
                 profiler.finish();
                 auto res = build_factor_result(raw_factors, val, m_userStopped.load());
                 output = format_result(res, timer.elapsed(), profiler);

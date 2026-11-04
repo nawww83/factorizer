@@ -651,8 +651,10 @@ std::optional<T> ecm_parallel(const T& n,
 }
 
 // --- 4. Главный конвейер факторизации ---
-// skip_ecm = true: лестница ECM пропускается (удобно для полупростых чисел p×q —
-// после методов Полларда сразу запускается решето).
+// ECM-лестница запускается только там, где решето неприменимо (в авторежиме —
+// для чисел крупнее kSieveMaxBits). Перед решетом ECM не работает: на 205-битном
+// полупростом лестница тратила ~85 с и делитель не находила, тогда как решето
+// укладывалось в 12 с.
 //
 // Решето — это новый 2LP-SIQS (siqs_xor.hpp). Замеры на полупростых p×q:
 //  - 100 бит: ~3 с; 205 бит: ~4 с на 8 потоках; 262 бита: единицы минут.
@@ -665,7 +667,7 @@ constexpr unsigned kSieveHardMaxBits = 512;  // жёсткий предел ре
 constexpr unsigned kSiqsMaxBits = kSieveMaxBits; // совместимость с UI-сообщениями
 
 // Способ выбора решета (значение совпадает с индексом в GUI):
-//   0 — авто: решето до kSieveMaxBits, ECM-лестница для чисел крупнее 135 бит;
+//   0 — авто: решето до kSieveMaxBits, ECM-лестница для чисел крупнее;
 //   1 — принудительно решето: без ограничения по разрядности (пользователь сам
 //       решает, что готов ждать; выше 512 бит метод неприменим).
 enum SieveChoice : int {
@@ -679,7 +681,6 @@ template <typename T>
 std::vector<T> factor_parallel_generic(T n,
                                        std::function<void(const std::string&)> status_cb = nullptr,
                                        ::bignum::StageProfiler* profiler = nullptr,
-                                       bool skip_ecm = false,
                                        int sieve_method = kSieveAuto,
                                        std::function<void(double, const std::string&)> progress_cb = nullptr) {
     std::vector<T> factors;
@@ -769,8 +770,8 @@ std::vector<T> factor_parallel_generic(T n,
     auto pm1_res = pollard_pm1(n, 50000);
     if (pm1_res.has_value()) {
         T f = *pm1_res;
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
-        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, sieve_method, progress_cb);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -782,8 +783,8 @@ std::vector<T> factor_parallel_generic(T n,
     progress(0.11, "Pollard-Brent rho");
     T f_rho = ::bignum::generic_ecm::pollard_brent_rho(n, 200000);
     if (f_rho > T(1) && f_rho < n) {
-        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
-        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f_rho), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub1 = factor_parallel_generic(f_rho, status_cb, profiler, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f_rho), status_cb, profiler, sieve_method, progress_cb);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return factors;
@@ -820,26 +821,25 @@ std::vector<T> factor_parallel_generic(T n,
         if (f <= T(1) || f >= n)
             return false;
 
-        auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
-        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+        auto sub1 = factor_parallel_generic(f, status_cb, profiler, sieve_method, progress_cb);
+        auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f), status_cb, profiler, sieve_method, progress_cb);
         factors.insert(factors.end(), sub1.begin(), sub1.end());
         factors.insert(factors.end(), sub2.begin(), sub2.end());
         return true;
     };
 
-    // Быстрый прогон для небольших чисел (<= 135 бит): доли секунды, и ECM-лестница
-    // для них всё равно не запускается.
-    if (sieve_method == kSieveAuto && n_bits <= 135) {
-        if (try_sieve(false))
-            return factors;
-    }
+    // Быстрый прогон отдельным шагом не нужен: авторежим и так доходит до решета
+    // ниже (п. 8), а повторный вызов на тех же данных с фиксированным сидом давал
+    // бы тот же (детерминированный) результат.
 
-    // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) для чисел > 135 бит.
-    // При skip_ecm (полупростые числа) ECM пропускается целиком — сразу решето.
+    // 6. Полноценная лестница двухэтапного ECM (Stage 1 + Stage 2) — только для
+    // чисел крупнее kSieveMaxBits, где решето в авторежиме всё равно не запустится.
+    // Перед решетом ECM не работает: для полупростых p×q она не находит делитель,
+    // и её время целиком уходит в накладные расходы (см. замеры в README).
     // При явном выборе решета лестница ECM тоже не запускается: пользователь
     // просил конкретный метод, а на 512 битах ECM-план верхних тиров идёт часами
     // до собственно решета.
-    if (!skip_ecm && sieve_method == kSieveAuto && n.bit_width() > 135) {
+    if (sieve_method == kSieveAuto && n.bit_width() > kSieveMaxBits) {
         struct EcmStage
         {
             unsigned curves;
@@ -850,15 +850,12 @@ std::vector<T> factor_parallel_generic(T n,
         size_t bits = n.bit_width();
         std::vector<EcmStage> ecm_plan;
 
-        // Базовый план (быстрый поиск делителей до 20-30 цифр)
-        ecm_plan.push_back({25, 2000, 60000}); // Для поиска мелких факторов
+        // Обязательная часть плана (битность здесь всегда > 320): сначала дешёвые
+        // тиры для мелких факторов, затем средние — 150 и 450 кривых.
+        ecm_plan.push_back({25, 2000, 60000});
         ecm_plan.push_back({50, 10000, 300000});
-
-        // Средний план (добавляется для чисел > 200 бит)
-        if (bits > 200) {
-            ecm_plan.push_back({150, 50000, 1500000});
-            ecm_plan.push_back({450, 110000, 3500000}); // Граница вашего старого плана
-        }
+        ecm_plan.push_back({150, 50000, 1500000});
+        ecm_plan.push_back({450, 110000, 3500000});
 
         // Продвинутый план для больших чисел (> 350 бит)
         if (bits > 350) {
@@ -881,18 +878,17 @@ std::vector<T> factor_parallel_generic(T n,
             if (profiler)
                 profiler->start_stage(stage_name);
 
-            progress(0.14 + 0.30 * (static_cast<double>(&stage - ecm_plan.data())
+            progress(0.14 + 0.82 * (static_cast<double>(&stage - ecm_plan.data())
                                     / static_cast<double>(ecm_plan.size())),
                      stage_name);
 
             auto ecm_res = ecm_parallel(n, stage.curves, stage.B1, stage.B2, status_cb);
             if (ecm_res.has_value()) {
                 T f = *ecm_res;
-                auto sub1 = factor_parallel_generic(f, status_cb, profiler, skip_ecm, sieve_method, progress_cb);
+                auto sub1 = factor_parallel_generic(f, status_cb, profiler, sieve_method, progress_cb);
                 auto sub2 = factor_parallel_generic(::bignum::ops::div_q(n, f),
                                                     status_cb,
                                                     profiler,
-                                                    skip_ecm,
                                                     sieve_method,
                                                     progress_cb);
                 factors.insert(factors.end(), sub1.begin(), sub1.end());

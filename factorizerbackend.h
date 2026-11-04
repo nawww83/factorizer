@@ -19,7 +19,6 @@ class FactorizerBackend : public QObject
     // Доля выполненной работы 0..1 для индикатора прогресса. Монотонно
     // неубывающая внутри одного запуска (см. setProgress).
     Q_PROPERTY(double progress READ progress NOTIFY progressChanged)
-    Q_PROPERTY(bool skipEcm READ skipEcm WRITE setSkipEcm NOTIFY skipEcmChanged)
     // Способ факторизации (решето): 0 — авто, 1 — принудительно SIQS.
     Q_PROPERTY(int method READ method WRITE setMethod NOTIFY methodChanged)
 
@@ -36,14 +35,10 @@ public:
     bool isDarkMode() const;
     void setDarkMode(bool val);
 
-    // Пропуск алгоритма ECM при факторизации (полезно для полупростых чисел:
-    // сразу запускается решето, методы Полларда продолжают работать)
-    bool skipEcm() const { return m_skipEcm; }
-    void setSkipEcm(bool val);
-
-    // Способ факторизации: 0 — авто (решето SIQS до 320 бит + ECM-лестница),
-    // 1 — принудительно SIQS. Явный выбор снимает ограничение по разрядности:
-    // пользователь сам решает, что готов ждать (жёсткий предел — 512 бит).
+    // Способ факторизации: 0 — авто (решето SIQS до 320 бит, ECM-лестница только
+    // выше этого предела), 1 — принудительно SIQS. Явный выбор снимает ограничение
+    // по разрядности: пользователь сам решает, что готов ждать (жёсткий предел —
+    // 512 бит).
     int method() const { return m_method; }
     void setMethod(int val);
 
@@ -60,7 +55,6 @@ signals:
     void resultTextChanged();
     void progressChanged();
     void darkModeChanged();
-    void skipEcmChanged();
     void methodChanged();
     void semiprimeReady(const QString &number);
 
@@ -74,7 +68,6 @@ private:
 
     bool m_isRunning = false;
     bool m_darkMode = true;
-    bool m_skipEcm = false;
     int m_method = 0; // 0 — авто, 1 — принудительно SIQS
     std::atomic<bool> m_userStopped{false};
     QString m_statusText = "Готов к работе";

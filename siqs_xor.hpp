@@ -33,6 +33,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if defined(__SSE2__)
+#  include <emmintrin.h>
+#endif
 
 namespace bignum::siqs_xor {
 
@@ -336,6 +339,21 @@ inline void merge_exps(std::vector<FactorExp> &dst, const std::vector<FactorExp>
         if (!found)
             dst.push_back(fe);
     }
+}
+
+// То же для одного множителя: в горячем цикле разложения вызов через
+// initializer_list создавал вектор (аллокация) на каждый найденный простой.
+inline void merge_exp(std::vector<FactorExp> &dst, u32 idx, u32 cnt)
+{
+    for (auto &d : dst)
+    {
+        if (d.idx == idx)
+        {
+            d.cnt += cnt;
+            return;
+        }
+    }
+    dst.push_back({idx, cnt});
 }
 
 // Граф циклов 2LP на ориентированном остовном лесе.
@@ -835,6 +853,75 @@ struct SIQSConfig
     u32 split_idx = 0;
 };
 
+// Сдвиг корней при переходе к следующему полиному: x += delta (add = true) или
+// x -= delta (add = false) по модулю p. Условие `if (inv_A_mod_p[idx])` убрано:
+// у выбранных в A простых delta = 0, поэтому сдвиг нулевой в обоих режимах.
+// Скалярная ветка на каждом простом стоила дороже самой арифметики.
+inline void update_roots(u32 num_primes, const u32 *__restrict prime,
+                         const u32 *__restrict delta, u32 *__restrict sol1,
+                         u32 *__restrict sol2, bool add)
+{
+    u32 idx = 1;
+#if defined(__SSE2__)
+    if (add)
+    {
+        // sol < p и delta < p, значит сумма < 2p < 2^31: знаковое сравнение
+        // корректно, вычитание p делается по маске.
+        for (; idx + 4 <= num_primes; idx += 4)
+        {
+            const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(delta + idx));
+            const __m128i pp = _mm_loadu_si128(reinterpret_cast<const __m128i *>(prime + idx));
+            __m128i a = _mm_add_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(sol1 + idx)), d);
+            __m128i b = _mm_add_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(sol2 + idx)), d);
+            a = _mm_sub_epi32(a, _mm_andnot_si128(_mm_srai_epi32(_mm_sub_epi32(a, pp), 31), pp));
+            b = _mm_sub_epi32(b, _mm_andnot_si128(_mm_srai_epi32(_mm_sub_epi32(b, pp), 31), pp));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(sol1 + idx), a);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(sol2 + idx), b);
+        }
+    }
+    else
+    {
+        for (; idx + 4 <= num_primes; idx += 4)
+        {
+            const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(delta + idx));
+            const __m128i pp = _mm_loadu_si128(reinterpret_cast<const __m128i *>(prime + idx));
+            __m128i a = _mm_sub_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(sol1 + idx)), d);
+            __m128i b = _mm_sub_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(sol2 + idx)), d);
+            a = _mm_add_epi32(a, _mm_and_si128(pp, _mm_srai_epi32(a, 31)));
+            b = _mm_add_epi32(b, _mm_and_si128(pp, _mm_srai_epi32(b, 31)));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(sol1 + idx), a);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(sol2 + idx), b);
+        }
+    }
+#endif
+    if (add)
+    {
+        for (; idx < num_primes; ++idx)
+        {
+            const u32 p = prime[idx];
+            const u32 d = delta[idx];
+            const u32 s1_n = sol1[idx] + d;
+            sol1[idx] = (s1_n >= p) ? (s1_n - p) : s1_n;
+            const u32 s2_n = sol2[idx] + d;
+            sol2[idx] = (s2_n >= p) ? (s2_n - p) : s2_n;
+        }
+    }
+    else
+    {
+        for (; idx < num_primes; ++idx)
+        {
+            const u32 p = prime[idx];
+            const u32 d = delta[idx];
+            sol1[idx] = (sol1[idx] >= d) ? (sol1[idx] - d) : (sol1[idx] + p - d);
+            sol2[idx] = (sol2[idx] >= d) ? (sol2[idx] - d) : (sol2[idx] + p - d);
+        }
+    }
+}
+
 // Один батч A-полиномов (полностью однопоточный).
 inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 seed,
                                                     int poly_limit = 0)
@@ -909,11 +996,18 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
     std::vector<u32> sol1(num_primes, 0);
     std::vector<u32> sol2(num_primes, 0);
 
+    // floor(2^32 / p) для быстрого остатка в пробном делении: на 300 битах
+    // s_idx % p считается для ~6 тыс. простых на каждого кандидата, а деление
+    // на переменный делитель — это 20+ тактов. Умножение с восстановлением
+    // остатка стоит ~5 тактов и даёт тот же результат.
+    std::vector<u32> p_recip(num_primes, 0);
+
     for (u32 idx = 1; idx < num_primes; ++idx)
     {
+        const u32 p = cfg.prime_base[idx];
+        p_recip[idx] = static_cast<u32>((1ULL << 32) / p);
         if (is_chosen[idx])
             continue;
-        const u32 p = cfg.prime_base[idx];
         const u64 a_mod = A.mod_u64(p);
         const u32 inv_A = static_cast<u32>(inv_mod64(a_mod, p));
         inv_A_mod_p[idx] = inv_A;
@@ -945,10 +1039,33 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
     std::vector<RawRelation> found_relations;
 
     std::vector<uint8_t> sieve_logs(B_size);
-    std::vector<u32> in_block_large1;
-    std::vector<u32> in_block_large2;
+    // Попадания крупных простых в блок: старшие 32 бита — позиция, младшие —
+    // индекс простого. Раньше здесь лежали индексы, и второй проход (отбор
+    // выживших) заново читал sol1/sol2 по случайным адресам: на 300 битах это
+    // десятки тысяч промахов кэша на полином. Теперь проход идёт по плотному
+    // массиву пар, а индексация нужна только для редких выживших.
+    std::vector<u64> in_block_large1;
+    std::vector<u64> in_block_large2;
     in_block_large1.reserve(4096);
     in_block_large2.reserve(4096);
+
+    // Битовая карта выживших позиций и список попаданий крупных простых.
+    // Хеш-таблица на полином здесь была лишней: выживших единицы, а проверок —
+    // десятки тысяч, и каждая стоила похода в unordered_map. Карта на блок
+    // в 128 КБ занимает 16 КБ и целиком лежит в L1.
+    std::vector<u64> survivor_bits((B_size + 63) / 64);
+    std::vector<u32> survivor_idx;
+    // Отобранные пары (позиция, индекс простого) вместо двух параллельных
+    // векторов: одна загрузка на проверку в цикле разложения.
+    std::vector<u64> hit_pairs;
+    std::vector<u32> large_divs;
+    survivor_idx.reserve(1024);
+    hit_pairs.reserve(64);
+    large_divs.reserve(16);
+    // Переиспользуемый буфер множителей: раньше вектор создавался на каждого
+    // выжившего кандидата (сотни тысяч аллокаций за проход).
+    std::vector<FactorExp> exps;
+    exps.reserve(64);
 
     const int base_target_bits = static_cast<int>(cfg.kM.bit_width() / 2
                                                   + std::countr_zero(half_B));
@@ -977,34 +1094,14 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
             if (new_sign == -1)
             {
                 b_signed_add(two_Bv, true);
-                for (u32 idx = 1; idx < num_primes; ++idx)
-                {
-                    if (inv_A_mod_p[idx])
-                    {
-                        const u32 p = cfg.prime_base[idx];
-                        const u32 delta = row_v[idx];
-                        const u32 s1_n = sol1[idx] + delta;
-                        sol1[idx] = (s1_n >= p) ? (s1_n - p) : s1_n;
-                        const u32 s2_n = sol2[idx] + delta;
-                        sol2[idx] = (s2_n >= p) ? (s2_n - p) : s2_n;
-                    }
-                }
+                update_roots(num_primes, cfg.prime_base.data(), row_v.data(), sol1.data(),
+                             sol2.data(), true);
             }
             else
             {
                 b_signed_add(two_Bv, false);
-                for (u32 idx = 1; idx < num_primes; ++idx)
-                {
-                    if (inv_A_mod_p[idx])
-                    {
-                        const u32 p = cfg.prime_base[idx];
-                        const u32 delta = row_v[idx];
-                        sol1[idx] = (sol1[idx] >= delta) ? (sol1[idx] - delta)
-                                                         : (sol1[idx] + p - delta);
-                        sol2[idx] = (sol2[idx] >= delta) ? (sol2[idx] - delta)
-                                                         : (sol2[idx] + p - delta);
-                    }
-                }
+                update_roots(num_primes, cfg.prime_base.data(), row_v.data(), sol1.data(),
+                             sol2.data(), false);
             }
         }
 
@@ -1038,42 +1135,82 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
             if (s1 < B_size)
             {
                 s_ptr[s1] += lp;
-                in_block_large1.push_back(idx);
+                in_block_large1.push_back((static_cast<u64>(s1) << 32) | idx);
             }
             if (s2 < B_size)
             {
                 s_ptr[s2] += lp;
-                in_block_large2.push_back(idx);
+                in_block_large2.push_back((static_cast<u64>(s2) << 32) | idx);
             }
         }
 
         // 3. Поиск выживших кандидатов.
-        std::unordered_map<u32, std::vector<u32>> survivor_hits;
+        // Скан блока — самая дорогая часть после просева: на полином приходится
+        // B_size побайтовых сравнений. Сравниваем по 16 байт (SSE2), а результат
+        // сразу превращаем в индексы через movemask. Байты логарифмов знаковые
+        // только формально, поэтому перед cmpgt сдвигаем диапазон на 0x80.
+        survivor_idx.clear();
+        std::fill(survivor_bits.begin(), survivor_bits.end(), 0ULL);
+#if defined(__SSE2__)
+        {
+            const __m128i threshold =
+                _mm_set1_epi8(static_cast<char>((target_log - 1) ^ 0x80));
+            const __m128i flip = _mm_set1_epi8(static_cast<char>(0x80));
+            u32 s_idx = 0;
+            for (; s_idx + 16 <= B_size; s_idx += 16)
+            {
+                __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s_ptr + s_idx));
+                v = _mm_xor_si128(v, flip);
+                unsigned mask =
+                    static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpgt_epi8(v, threshold)));
+                while (mask)
+                {
+                    survivor_idx.push_back(s_idx + static_cast<u32>(std::countr_zero(mask)));
+                    mask &= mask - 1;
+                }
+            }
+            for (; s_idx < B_size; ++s_idx)
+                if (s_ptr[s_idx] >= target_log)
+                    survivor_idx.push_back(s_idx);
+        }
+#else
         for (u32 s_idx = 0; s_idx < B_size; ++s_idx)
             if (s_ptr[s_idx] >= target_log)
-                survivor_hits[s_idx] = {};
+                survivor_idx.push_back(s_idx);
+#endif
 
-        if (survivor_hits.empty())
+        if (survivor_idx.empty())
             continue;
 
-        for (u32 idx : in_block_large1)
+        for (u32 s_idx : survivor_idx)
+            survivor_bits[s_idx >> 6] |= 1ULL << (s_idx & 63);
+
+        // Крупные простые (p >= B_size) делят Q(x) только там, где их корень
+        // попал в блок. Отбираем попадания в выжившие позиции: проверка — один
+        // бит из карты в L1 вместо поиска в хеш-таблице на каждое простое.
+        // Позиция уже лежит рядом с индексом, поэтому читать sol1/sol2 заново
+        // не нужно — проход идёт по плотному массиву.
+        hit_pairs.clear();
+        for (u64 h : in_block_large1)
         {
-            auto it = survivor_hits.find(sol1[idx]);
-            if (it != survivor_hits.end())
-                it->second.push_back(idx);
+            const u32 pos = static_cast<u32>(h >> 32);
+            if ((survivor_bits[pos >> 6] >> (pos & 63)) & 1ULL)
+                hit_pairs.push_back(h);
         }
-        for (u32 idx : in_block_large2)
+        for (u64 h : in_block_large2)
         {
-            auto it = survivor_hits.find(sol2[idx]);
-            if (it != survivor_hits.end())
-                it->second.push_back(idx);
+            const u32 pos = static_cast<u32>(h >> 32);
+            if ((survivor_bits[pos >> 6] >> (pos & 63)) & 1ULL)
+                hit_pairs.push_back(h);
         }
 
         // 4. Точное разложение выживших кандидатов.
-        for (const auto &kv : survivor_hits)
+        for (u32 s_idx : survivor_idx)
         {
-            const u32 s_idx = kv.first;
-            const auto &large_divs = kv.second;
+            large_divs.clear();
+            for (u64 h : hit_pairs)
+                if (static_cast<u32>(h >> 32) == s_idx)
+                    large_divs.push_back(static_cast<u32>(h));
 
             const u32 mask = half_B ^ s_idx;
             const i64 y = static_cast<i64>(half_B ^ mask) - static_cast<i64>(half_B);
@@ -1116,8 +1253,7 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
             }
 
             Big temp = diff / A;
-            std::vector<FactorExp> exps;
-            exps.reserve(24);
+            exps.clear();
             for (u32 a_idx : chosen_indices)
                 exps.push_back({a_idx, 1});
 
@@ -1147,14 +1283,18 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
                         temp.divrem_u64(p);
                         ++cnt;
                     }
-                    merge_exps(exps, {{idx, cnt}});
+                    merge_exp(exps, idx, cnt);
                 }
             }
 
             for (u32 idx = 1; idx < cfg.split_idx; ++idx)
             {
                 const u32 p = cfg.prime_base[idx];
-                const u32 rem_s = s_idx % p;
+                // Остаток через предвычисленное floor(2^32 / p) вместо деления.
+                const u32 q_est = static_cast<u32>((static_cast<u64>(s_idx) * p_recip[idx]) >> 32);
+                u32 rem_s = s_idx - q_est * p;
+                if (rem_s >= p)
+                    rem_s -= p;
                 if (rem_s == sol1[idx] || rem_s == sol2[idx] || is_chosen[idx])
                 {
                     if (temp.mod_u64(p) == 0)
@@ -1165,7 +1305,7 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
                             temp.divrem_u64(p);
                             ++cnt;
                         }
-                        merge_exps(exps, {{idx, cnt}});
+                        merge_exp(exps, idx, cnt);
                         if (temp.bit_width() <= 1)
                             break;
                     }
@@ -1183,7 +1323,7 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
                 auto pit = cfg.prime_to_idx.find(cof);
                 if (pit != cfg.prime_to_idx.end())
                 {
-                    merge_exps(exps, {{pit->second, 1}});
+                    merge_exp(exps, pit->second, 1);
                     cof = 1;
                 }
                 else
@@ -1198,11 +1338,11 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
 
             if (cof == 1)
             {
-                found_relations.push_back({1, 1, X_val, sign, std::move(exps)});
+                found_relations.push_back({1, 1, X_val, sign, exps});
             }
             else if (cof <= cfg.lp_bound)
             {
-                found_relations.push_back({1, cof, X_val, sign, std::move(exps)});
+                found_relations.push_back({1, cof, X_val, sign, exps});
             }
             else if (cof >= cfg.min_2lp_comp)
             {
@@ -1215,7 +1355,7 @@ inline std::vector<RawRelation> process_one_A_batch(const SIQSConfig &cfg, u64 s
                             && f2 > cfg.last_prime && f2 <= cfg.lp_bound)
                         {
                             if (is_prime64(f1) && is_prime64(f2))
-                                found_relations.push_back({f1, f2, X_val, sign, std::move(exps)});
+                                found_relations.push_back({f1, f2, X_val, sign, exps});
                         }
                     }
                 }
@@ -1240,14 +1380,23 @@ inline AutoParams auto_tune_siqs(const Big &M)
     const double ln_M = bits * 0.6931471805599453;
     const double ln_ln_M = std::log(ln_M);
 
-    const double exponent = 0.357 * std::sqrt(ln_M * ln_ln_M) + 3.3;
+    // Граница факторной базы. Свободный член подобран по замерам: на 160/192/205/
+    // 224/256 битах оптимум лежит примерно втрое ниже значения, которое давала
+    // прежняя формула (+3.3). Меньше база — больше полиномов, но каждый дешевле:
+    // при +2.0 время падает в 1.3…2.6 раза, а матрица Гаусса получается меньше
+    // (см. таблицу производительности в README).
+    const double exponent = 0.357 * std::sqrt(ln_M * ln_ln_M) + 2.0;
     const double raw_bound = std::exp(exponent);
 
     u32 prime_bound = static_cast<u32>(std::round(raw_bound / 10000.0) * 10000.0);
+    const bool base_at_floor = prime_bound < 50000U;
     prime_bound = std::max(50000U, std::min(prime_bound, 8000000U));
 
+    // Ширина блока. На 160–192 битах замеры дают 17 бит (B = 65536) против 16,
+    // на 128 — наоборот, 16: слишком широкий интервал раздувает |Q(x)| и
+    // соотношений становится меньше, чем экономит просев.
     int block_bits = 16;
-    if (bits >= 200)
+    if (bits >= 150)
         block_bits = 17;
     if (bits >= 270)
         block_bits = 18;
@@ -1256,6 +1405,14 @@ inline AutoParams auto_tune_siqs(const Big &M)
     const double log2_target_A = 0.5 * (bits + 1.0) - std::log2(half_B);
     const double log2_avg_q = std::log2(static_cast<double>(prime_bound)) * 0.62;
     int s = static_cast<int>(std::round(log2_target_A / log2_avg_q));
+    // Если база упёрлась в нижний предел, годных q заметно меньше, чем предсказывает
+    // формула, и лишний множитель в A только портит полиномы: на 144–176 битах
+    // s на единицу меньше даёт 1.2–1.6 раза (например, 160 бит: 0.62 → 0.40 с).
+    if (base_at_floor)
+        --s;
+    // Потолок 10: на 300 битах формула просит 10.7, но 11 множителей дают
+    // измеримо худший результат (1546 с против 1508 с) — выигрыш от вдвое более
+    // редкой подготовки A не покрывает ухудшения самих полиномов.
     s = std::max(5, std::min(s, 10));
 
     return {prime_bound, block_bits, s};

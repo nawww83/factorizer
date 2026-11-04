@@ -13,11 +13,10 @@ namespace {
 int g_failures = 0;
 
 template <typename T>
-void run_case(const char *label, const std::string &str, int method, bool skip_ecm)
+void run_case(const char *label, const std::string &str, int method)
 {
     T n = T::fromString(str);
-    std::cout << "== " << label << " (" << n.bit_width() << " бит, method=" << method
-              << ", skip_ecm=" << skip_ecm << ")\n";
+    std::cout << "== " << label << " (" << n.bit_width() << " бит, method=" << method << ")\n";
 
     const auto t0 = std::chrono::steady_clock::now();
     std::string last_status;
@@ -28,7 +27,7 @@ void run_case(const char *label, const std::string &str, int method, bool skip_e
         std::cout << "   [status] " << s << "\n";
     };
 
-    auto factors = bignum::generic_ecm::factor_parallel_generic(n, status, nullptr, skip_ecm, method);
+    auto factors = bignum::generic_ecm::factor_parallel_generic(n, status, nullptr, method);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
@@ -54,10 +53,10 @@ int main()
     const std::string semiprime205 =
         "33801295533024112192430315909773114733482083162238224697211891";
 
-    run_case<U128>("100-бит, авто, без ECM", semiprime100, bignum::generic_ecm::kSieveAuto, true);
+    run_case<U128>("100-бит, авто", semiprime100, bignum::generic_ecm::kSieveAuto);
     run_case<U128>("100-бит, принудительный SIQS", semiprime100,
-                   bignum::generic_ecm::kSieveForced, false);
-    run_case<U256>("205-бит, авто, без ECM", semiprime205, bignum::generic_ecm::kSieveAuto, true);
+                   bignum::generic_ecm::kSieveForced);
+    run_case<U256>("205-бит, авто", semiprime205, bignum::generic_ecm::kSieveAuto);
 
     std::cout << (g_failures == 0 ? "pipeline self-test: OK\n" : "pipeline self-test: FAILED\n");
     return g_failures == 0 ? 0 : 1;

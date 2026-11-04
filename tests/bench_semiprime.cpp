@@ -4,8 +4,7 @@
 //                                           заданной битности и разложить их;
 //   bench_semiprime --n <десятичное>      — разложить заданное число.
 //
-// Факторизация идёт тем же конвейером, что и в приложении: режим «Авто»,
-// ECM пропущен (типичный сценарий для полупростых чисел).
+// Факторизация идёт тем же конвейером, что и в приложении: режим «Авто».
 #include "generic_factorizer.hpp"
 
 #include <chrono>
@@ -37,7 +36,7 @@ int measure(const T &n)
 {
     const auto t0 = std::chrono::steady_clock::now();
     auto factors = bignum::generic_ecm::factor_parallel_generic(
-        n, nullptr, nullptr, /*skip_ecm=*/true, bignum::generic_ecm::kSieveAuto);
+        n, nullptr, nullptr, bignum::generic_ecm::kSieveAuto);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 

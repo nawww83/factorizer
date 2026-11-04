@@ -281,7 +281,12 @@ public:
             return 0;
 #if defined(__SIZEOF_INT128__)
         unsigned __int128 rem = 0;
-        for (uint32_t i = WORDS; i-- > 0;)
+        // Незначащие старшие слова пропускаем: числа в SIQS — это 3–6 слов, и
+        // деление всех восьми слов на каждый простой базы стоило заметно.
+        uint32_t i = WORDS;
+        while (i > 0 && w[i - 1] == 0)
+            --i;
+        for (; i-- > 0;)
         {
             unsigned __int128 cur = (rem << 64) | w[i];
             w[i] = static_cast<uint64_t>(cur / d);
@@ -290,7 +295,10 @@ public:
         return static_cast<uint64_t>(rem);
 #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
         uint64_t rem = 0;
-        for (uint32_t i = WORDS; i-- > 0;)
+        uint32_t i = WORDS;
+        while (i > 0 && w[i - 1] == 0)
+            --i;
+        for (; i-- > 0;)
         {
             uint64_t rem_out = 0;
             w[i] = _udiv128(rem, w[i], d, &rem_out);

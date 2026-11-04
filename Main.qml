@@ -343,31 +343,6 @@ ApplicationWindow {
 
             }
 
-            // Переключатель пропуска алгоритма ECM
-            Switch {
-                id: skipEcmSwitch
-
-                text: "Пропускать ECM"
-                checked: backend.skipEcm
-                enabled: !backend.isRunning
-                onToggled: backend.skipEcm = checked
-
-                contentItem: Text {
-                    text: skipEcmSwitch.text
-                    font: skipEcmSwitch.font
-                    color: skipEcmSwitch.enabled ? colTextPrimary : colTextSecondary
-                    verticalAlignment: Text.AlignVCenter
-                    leftPadding: skipEcmSwitch.indicator.width + skipEcmSwitch.spacing
-                }
-
-                ToolTip.visible: hovered
-                ToolTip.text: "Полностью отключает лестницу ECM (для полупростых p×q:\n"
-                              + "сразу работает решето SIQS). Методы Полларда — работают.\n\n"
-                              + "ECM применяется только в режиме «Авто» к числам от 136 бит:\n"
-                              + "меньшие числа мгновенно раскладывает решето SIQS.\n"
-                              + "При явном выборе метода ECM не запускается и так."
-            }
-
             // Явный выбор метода решета: авто / SIQS
             Label {
                 text: "Метод:"
@@ -409,7 +384,7 @@ ApplicationWindow {
 
                 ToolTip.visible: hovered
                 ToolTip.text: "Метод факторизации:\n"
-                              + "• Авто — решето SIQS до 320 бит, ECM-лестница для чисел крупнее;\n"
+                              + "• Авто — решето SIQS до 320 бит, выше — ECM и методы Полларда;\n"
                               + "• SIQS — всегда квадратичное решето, без ограничения разрядности.\n\n"
                               + "При явном выборе работает только выбранный метод (плюс пробное\n"
                               + "деление, Поллард и проверка простоты): лестница ECM не запускается,\n"
