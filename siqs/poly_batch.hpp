@@ -252,8 +252,9 @@ inline BatchResult process_one_A_batch(const SIQSConfig &cfg, u64 seed,
     const int base_target_bits = static_cast<int>(cfg.kM.bit_width() / 2
                                                   + std::countr_zero(half_B));
     const int lp2_bits = static_cast<int>(std::bit_width(cfg.lp2_bound));
+    const int cof_bits = lp2_bits + static_cast<int>(cfg.lp3_slack_bits);
     const uint8_t target_log = static_cast<uint8_t>(
-        std::min(250, std::max(15, base_target_bits - lp2_bits + 2)));
+        std::min(250, std::max(15, base_target_bits - cof_bits + 2)));
 
     st.t_prep += since(t_phase, clock_now());
 
@@ -526,7 +527,10 @@ inline BatchResult process_one_A_batch(const SIQSConfig &cfg, u64 seed,
                 continue;
             }
             u64 cof = temp.low_word();
-            if (cof > cfg.lp2_bound)
+            // Без 3LP верхняя граница кофактора прежняя — lp2_bound: иначе
+            // лишние кандидаты уходили бы в разложение впустую.
+            const u64 cof_gate = cfg.lp3_slack_bits ? cfg.lp3_bound : cfg.lp2_bound;
+            if (cof > cof_gate)
             {
                 ++st.dropped_big_cofactor;
                 continue;
@@ -581,7 +585,17 @@ inline BatchResult process_one_A_batch(const SIQSConfig &cfg, u64 seed,
                     }
                     else
                     {
-                        ++st.dropped_nonsplit;
+                        // Кофактор не делится на два допустимых простых —
+                        // пробуем три. Пока только считаем: в матрицу такие
+                        // соотношения не идут и на раннюю остановку не влияют,
+                        // иначе сдвинулась бы траектория A-наборов.
+                        u64 g1 = 0, g2 = 0, g3 = 0;
+                        if (cfg.lp3_slack_bits
+                            && brent_factor_three_primes(cof, cfg.last_prime,
+                                                         cfg.lp_bound, g1, g2, g3))
+                            ++st.rel_3lp;
+                        else
+                            ++st.dropped_nonsplit;
                     }
                 }
             }

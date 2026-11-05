@@ -27,6 +27,11 @@ struct SIQSConfig
     u64 min_2lp_comp = 0;
     u64 lp_bound = 0;
     u64 lp2_bound = 0;
+    u64 lp3_bound = 0;
+    // Насколько ослабить порог сита сверх lp2_bound, бит. 0 — 2LP-режим:
+    // выжившие с остатком больше lp2_bound отсекаются, 3LP не встречается.
+    // Значение подбирается замерами (шаг 3.4).
+    u32 lp3_slack_bits = 0;
     u32 B_size = 0;
     u32 half_B = 0;
     int s = 0;

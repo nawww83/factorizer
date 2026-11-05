@@ -219,6 +219,38 @@ inline bool brent_factor_two_primes(u64 n, u64 &f1, u64 &f2)
     return false;
 }
 
+// Разложение 64-битного кофактора ровно на три простых множителя. Брент
+// сначала делит n надвое, затем один из множителей — ещё надвое; все три
+// обязаны быть простыми и лежать в (lower, upper]. Порядок — по возрастанию,
+// чтобы тройка была канонической (это понадобится графу 3LP).
+inline bool brent_factor_three_primes(u64 n, u64 lower, u64 upper,
+                                      u64 &p1, u64 &p2, u64 &p3)
+{
+    u64 a = 0, b = 0;
+    if (!brent_factor_two_primes(n, a, b))
+        return false;
+    for (int turn = 0; turn < 2; ++turn)
+    {
+        const u64 maybe_prime = (turn == 0) ? a : b;
+        const u64 to_split = (turn == 0) ? b : a;
+        if (!is_prime64(maybe_prime))
+            continue;
+        u64 c = 0, d = 0;
+        if (!brent_factor_two_primes(to_split, c, d) || !is_prime64(c) || !is_prime64(d))
+            continue;
+        u64 f[3] = {maybe_prime, c, d};
+        std::sort(f, f + 3);
+        if (f[0] > lower && f[2] <= upper)
+        {
+            p1 = f[0];
+            p2 = f[1];
+            p3 = f[2];
+            return true;
+        }
+    }
+    return false;
+}
+
 // Алгоритм Тонелли — Шэнкса: r^2 == n (mod p).
 inline u32 tonelli_shanks(u64 n, u32 p)
 {

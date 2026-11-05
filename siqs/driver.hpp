@@ -25,6 +25,11 @@ struct AutoParams
     u32 prime_bound;
     int block_bits;
     int num_a_factors;
+    // Ослабление порога сита под 3LP, бит (0 — выключено). Замеры на
+    // 160–256 битах показали, что 3LP начинает давать соотношения только
+    // при slack ≥ 8, а стоит это 3–45× времени (см. README), поэтому
+    // по умолчанию выключено: механизм оставлен как задел.
+    u32 lp3_slack_bits;
 };
 
 inline AutoParams auto_tune_siqs(const Big &M)
@@ -68,7 +73,7 @@ inline AutoParams auto_tune_siqs(const Big &M)
     // редкой подготовки A не покрывает ухудшения самих полиномов.
     s = std::max(5, std::min(s, 10));
 
-    return {prime_bound, block_bits, s};
+    return {prime_bound, block_bits, s, 0};
 }
 
 inline u32 find_best_multiplier(const Big &M, const std::vector<u32> &small_primes)
@@ -128,7 +133,7 @@ inline std::vector<u32> sieve_primes(u32 limit)
 // --- Основной запуск --------------------------------------------------------
 
 inline std::optional<Big> run_siqs(const Big &M, u32 prime_bound, int block_bits,
-                                   int num_a_factors,
+                                   int num_a_factors, u32 lp3_slack_bits,
                                    const std::function<void(const std::string &)> &status_cb,
                                    const std::function<void(double, const std::string &)> &progress_cb)
 {
@@ -192,6 +197,13 @@ inline std::optional<Big> run_siqs(const Big &M, u32 prime_bound, int block_bits
     cfg.min_2lp_comp = cfg.last_prime * cfg.last_prime;
     cfg.lp_bound = static_cast<u64>(prime_bound) * 30ULL;
     cfg.lp2_bound = cfg.lp_bound * cfg.lp_bound;
+    // Кофактор дальше 63 бит сито всё равно не рассматривает, поэтому куб
+    // lp_bound ограничен сверху: 2^21 — это cbrt(2^63). Для баз крупнее
+    // (lp_bound > 2^21) граница 3LP фактически совпадает с пределом кофактора.
+    cfg.lp3_bound = (cfg.lp_bound < (1ULL << 21))
+                        ? cfg.lp_bound * cfg.lp_bound * cfg.lp_bound
+                        : ((1ULL << 63) - 1);
+    cfg.lp3_slack_bits = lp3_slack_bits;
 
     cfg.split_idx = cfg.num_primes;
     for (u32 i = 0; i < cfg.num_primes; ++i)
@@ -317,7 +329,8 @@ inline std::optional<Big> run_siqs(const Big &M, u32 prime_bound, int block_bits
              + std::to_string(gauss.relations.size()) + " ("
              + std::to_string(total_stats.rel_full) + " полных / "
              + std::to_string(total_stats.rel_1lp) + " 1LP / "
-             + std::to_string(total_stats.rel_2lp) + " 2LP), простых (>=2 вх.): "
+             + std::to_string(total_stats.rel_2lp) + " 2LP / "
+             + std::to_string(total_stats.rel_3lp) + " 3LP), простых (>=2 вх.): "
              + std::to_string(gauss.multi_hit_primes) + " (синглетонов: "
              + std::to_string(gauss.singleton_primes) + ", циклов 2LP: "
              + std::to_string(lp_graph.cycles_found) + ")");
@@ -413,7 +426,8 @@ std::optional<T> factor(const T &n,
                   + ", num_a_factors=" + std::to_string(params.num_a_factors));
 
     const auto divisor = run_siqs(M, params.prime_bound, params.block_bits,
-                                  params.num_a_factors, status_cb, progress_cb);
+                                  params.num_a_factors, params.lp3_slack_bits,
+                                  status_cb, progress_cb);
     if (!divisor.has_value())
         return std::nullopt;
     return T(*divisor);

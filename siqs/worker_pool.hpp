@@ -29,6 +29,7 @@ struct SieveStats
     u64 rel_full = 0;
     u64 rel_1lp = 0;
     u64 rel_2lp = 0;
+    u64 rel_3lp = 0;
     u64 dropped_big_cofactor = 0;
     u64 dropped_nonsplit = 0;
     double t_prep = 0.0;
@@ -45,6 +46,7 @@ struct SieveStats
         rel_full += o.rel_full;
         rel_1lp += o.rel_1lp;
         rel_2lp += o.rel_2lp;
+        rel_3lp += o.rel_3lp;
         dropped_big_cofactor += o.dropped_big_cofactor;
         dropped_nonsplit += o.dropped_nonsplit;
         t_prep += o.t_prep;
@@ -53,7 +55,7 @@ struct SieveStats
         t_factor += o.t_factor;
     }
 
-    u64 relations() const { return rel_full + rel_1lp + rel_2lp; }
+    u64 relations() const { return rel_full + rel_1lp + rel_2lp + rel_3lp; }
 };
 
 struct BatchResult
