@@ -25,6 +25,14 @@ qt_add_executable(appfactorizer
     u128_utils.h
     u128_intrinsics.hpp
     siqs_xor.hpp
+    siqs/common.hpp
+    siqs/relation.hpp
+    siqs/worker_pool.hpp
+    siqs/large_prime_graph.hpp
+    siqs/gauss.hpp
+    siqs/config.hpp
+    siqs/poly_batch.hpp
+    siqs/driver.hpp
     generic_factorizer.hpp
     cpu_topology.hpp
 )
@@ -38,6 +46,14 @@ qt_add_qml_module(appfactorizer
         factorizerbackend.cpp
         generic_factorizer.hpp
         siqs_xor.hpp
+        siqs/common.hpp
+        siqs/relation.hpp
+        siqs/worker_pool.hpp
+        siqs/large_prime_graph.hpp
+        siqs/gauss.hpp
+        siqs/config.hpp
+        siqs/poly_batch.hpp
+        siqs/driver.hpp
 )
 
 target_link_libraries(appfactorizer PRIVATE
