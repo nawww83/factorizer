@@ -307,6 +307,8 @@ inline BatchResult process_one_A_batch(const SIQSConfig &cfg, u64 seed,
         t_phase = clock_now();
 
         // 1. Просеивание малых и средних простых.
+        // Оба корня пишутся в одной итерации: цикл вдвое короче по накладным
+        // расходам, а две независимые записи лучше загружают конвейер.
         for (u32 idx = cfg.small_prime_skip; idx < cfg.split_idx; ++idx)
         {
             if (inv_A_mod_p[idx] == 0)
@@ -315,11 +317,23 @@ inline BatchResult process_one_A_batch(const SIQSConfig &cfg, u64 seed,
             const uint8_t lp = cfg.log_primes[idx];
             const u32 s1 = sol1[idx];
             const u32 s2 = sol2[idx];
-            for (u32 s_idx = s1; s_idx < B_size; s_idx += p)
-                s_ptr[s_idx] += lp;
-            if (s2 != s1)
-                for (u32 s_idx = s2; s_idx < B_size; s_idx += p)
+            if (s1 == s2)
+            {
+                for (u32 s_idx = s1; s_idx < B_size; s_idx += p)
                     s_ptr[s_idx] += lp;
+                continue;
+            }
+            const u32 lo = (s1 < s2) ? s1 : s2;
+            const u32 d = (s1 < s2) ? (s2 - s1) : (s1 - s2);
+            u32 s_idx = lo;
+            const u32 both_end = B_size - d;
+            for (; s_idx < both_end; s_idx += p)
+            {
+                s_ptr[s_idx] += lp;
+                s_ptr[s_idx + d] += lp;
+            }
+            if (s_idx < B_size)
+                s_ptr[s_idx] += lp;
         }
 
         // 2. Просеивание крупных простых (p >= B_size).
